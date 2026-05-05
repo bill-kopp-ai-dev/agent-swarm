@@ -4,10 +4,13 @@ import { chunkContent } from "../be/chunking";
 import { getEmbeddingProvider, getMemoryStore } from "../be/memory";
 import { CANDIDATE_SET_MULTIPLIER } from "../be/memory/constants";
 import { recordRetrievals } from "../be/memory/raters/retrieval";
+import { applyRating, ExplicitSelfDuplicateError } from "../be/memory/raters/store";
+import type { RatingEvent } from "../be/memory/raters/types";
 import { rerank } from "../be/memory/reranker";
+import { getRetrievalsForAgent, hasRetrievalForTask } from "../be/memory/retrieval-store";
 import { AgentMemoryScopeSchema, AgentMemorySourceSchema } from "../types";
 import { route } from "./route-def";
-import { json, jsonError } from "./utils";
+import { json, jsonError, parseQueryParams } from "./utils";
 
 // ─── Route Definitions ───────────────────────────────────────────────────────
 
@@ -113,6 +116,59 @@ const deleteMemoryById = route({
   responses: {
     200: { description: "Memory deleted" },
     404: { description: "Memory not found" },
+  },
+});
+
+// Memory rater v1.5 — worker-facing rating endpoints. Plan:
+// thoughts/taras/plans/2026-05-05-memory-rater-v1.5/step-3.md
+//
+// `source` is restricted to `llm` and `explicit-self` at the HTTP boundary —
+// `implicit-citation` runs in-process server-side via applyRating directly
+// and must never arrive over HTTP (defence against worker spoofing).
+const RateEventSchema = z.object({
+  memoryId: z.string().min(1),
+  signal: z.number().min(-1).max(1),
+  weight: z.number().min(0).max(1),
+  source: z.enum(["llm", "explicit-self"]),
+  reasoning: z.string().max(500).optional(),
+  taskId: z.string().uuid().optional(),
+});
+
+const rateMemory = route({
+  method: "post",
+  path: "/api/memory/rate",
+  pattern: ["api", "memory", "rate"],
+  summary: "Submit RatingEvents to update memory usefulness posteriors",
+  tags: ["Memory"],
+  auth: { apiKey: true, agentId: true },
+  body: z.object({
+    events: z.array(RateEventSchema).min(1).max(50),
+  }),
+  responses: {
+    200: { description: "Ratings applied; per-event rejections returned in body" },
+    400: { description: "Validation error or explicit-self R6 spam-guard rejection" },
+    409: { description: "Duplicate explicit-self rating for (taskId, memoryId)" },
+  },
+});
+
+const getRetrievals = route({
+  method: "get",
+  path: "/api/memory/retrievals",
+  pattern: ["api", "memory", "retrievals"],
+  summary: "List memories retrieved for a task or session (rater input)",
+  tags: ["Memory"],
+  auth: { apiKey: true, agentId: true },
+  query: z
+    .object({
+      taskId: z.string().uuid().optional(),
+      sessionId: z.string().optional(),
+    })
+    .refine((q) => q.taskId || q.sessionId, {
+      message: "taskId or sessionId required",
+    }),
+  responses: {
+    200: { description: "Retrieval rows joined with agent_memory" },
+    400: { description: "Missing taskId/sessionId or X-Agent-ID" },
   },
 });
 
@@ -408,6 +464,89 @@ export async function handleMemory(
       console.log(`[memory] Re-embedding complete: ${memories.length} memories`);
     })();
 
+    return true;
+  }
+
+  if (rateMemory.match(req.method, pathSegments)) {
+    if (!myAgentId) {
+      jsonError(res, "Missing X-Agent-ID header", 400);
+      return true;
+    }
+
+    const parsed = await rateMemory.parse(req, res, pathSegments, new URLSearchParams());
+    if (!parsed) return true;
+
+    const { events } = parsed.body;
+
+    // R6 spam guard: explicit-self requires a matching memory_retrieval row.
+    // Reject the whole batch on first offender so the worker sees a clear 400.
+    for (const evt of events) {
+      if (evt.source !== "explicit-self") continue;
+      if (!evt.taskId) {
+        jsonError(res, `explicit-self rating for memoryId=${evt.memoryId} requires taskId`, 400);
+        return true;
+      }
+      if (!hasRetrievalForTask(evt.taskId, evt.memoryId)) {
+        jsonError(
+          res,
+          `explicit-self rating rejected: memoryId=${evt.memoryId} not present in memory_retrieval for task=${evt.taskId}`,
+          400,
+        );
+        return true;
+      }
+    }
+
+    // applyRating's ctx carries a single taskId for the batch. Group events by
+    // taskId so each call gets a single coherent ctx (and one transaction).
+    const groups = new Map<string | undefined, typeof events>();
+    for (const evt of events) {
+      const list = groups.get(evt.taskId) ?? [];
+      list.push(evt);
+      groups.set(evt.taskId, list);
+    }
+
+    let applied = 0;
+    const rejected: { memoryId: string; reason: string }[] = [];
+    try {
+      for (const [taskId, batch] of groups) {
+        const ratingEvents: RatingEvent[] = batch.map((e) => ({
+          memoryId: e.memoryId,
+          signal: e.signal,
+          weight: e.weight,
+          source: e.source,
+          reasoning: e.reasoning,
+        }));
+        const result = applyRating(ratingEvents, { taskId });
+        applied += result.applied;
+        for (const r of result.rejected) {
+          rejected.push({ memoryId: r.event.memoryId, reason: r.reason });
+        }
+      }
+    } catch (err) {
+      if (err instanceof ExplicitSelfDuplicateError) {
+        jsonError(res, `Duplicate explicit-self rating for memoryId=${err.event.memoryId}`, 409);
+        return true;
+      }
+      throw err;
+    }
+
+    json(res, { applied, rejected });
+    return true;
+  }
+
+  if (getRetrievals.match(req.method, pathSegments)) {
+    if (!myAgentId) {
+      jsonError(res, "Missing X-Agent-ID header", 400);
+      return true;
+    }
+
+    const queryParams = parseQueryParams(req.url || "");
+    const parsed = await getRetrievals.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const { taskId, sessionId } = parsed.query;
+    const rows = getRetrievalsForAgent(myAgentId, { taskId, sessionId });
+    json(res, { results: rows });
     return true;
   }
 
