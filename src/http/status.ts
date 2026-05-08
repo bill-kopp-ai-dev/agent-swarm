@@ -18,6 +18,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import {
+  getAgentHarnessProviders,
   getDb,
   getInstanceActivity,
   getLiveAgentCounts,
@@ -45,6 +46,19 @@ export const SetupMilestoneIdSchema = z.enum([
 ]);
 export type SetupMilestoneId = z.infer<typeof SetupMilestoneIdSchema>;
 
+/**
+ * Per-provider rollup attached to the `harness` milestone when the swarm has
+ * registered workers reporting `cred_status`. The milestone aggregates these
+ * into a single state for `health` rollup, but the array lets the UI render
+ * a per-provider breakdown (e.g. "claude verified · codex blocked").
+ */
+export const HarnessProviderRollupSchema = z.object({
+  provider: ProviderNameSchema,
+  state: SetupMilestoneStateSchema,
+  workers: z.number().int().nonnegative(),
+});
+export type HarnessProviderRollup = z.infer<typeof HarnessProviderRollupSchema>;
+
 export const SetupMilestoneSchema = z.object({
   id: SetupMilestoneIdSchema,
   label: z.string(),
@@ -53,10 +67,16 @@ export const SetupMilestoneSchema = z.object({
   action_url: z.string().optional(),
   /**
    * Canonical harness provider name. Only populated on the `harness`
-   * milestone when `process.env.HARNESS_PROVIDER` is a known canonical
-   * provider. The UI uses this directly (no hint-string regex).
+   * milestone when the fleet contains exactly one distinct provider —
+   * otherwise undefined and the UI falls back to `providers[]`.
    */
   provider: ProviderNameSchema.optional(),
+  /**
+   * Per-provider rollup. Populated on the `harness` milestone whenever the
+   * fleet has ≥1 registered worker. Empty array possible if all rows have
+   * `harness_provider = NULL` (legacy agents pre-migration 054).
+   */
+  providers: z.array(HarnessProviderRollupSchema).optional(),
 });
 export type SetupMilestone = z.infer<typeof SetupMilestoneSchema>;
 
@@ -225,92 +245,97 @@ function buildIdentity(): StatusIdentity {
 
 // ─── Setup milestones ────────────────────────────────────────────────────────
 
-function harnessMilestone(): SetupMilestone {
-  const providerRaw = process.env.HARNESS_PROVIDER?.trim();
-  if (!providerRaw) {
-    return {
-      id: "harness",
-      label: "Harness configured",
-      state: "unverified",
-      hint: "Set a harness provider and the matching credentials (e.g. claude + ANTHROPIC_API_KEY).",
-      action_url: "/integrations",
-    };
-  }
-
-  // Only emit `provider` on the milestone when the env value is a canonical
-  // provider name. Unknown values still flow through (so `unverified` is
-  // reported), but the UI doesn't get a bogus name.
-  const parsed = ProviderNameSchema.safeParse(providerRaw);
-  const providerName = parsed.success ? parsed.data : undefined;
-
-  if (!providerName) {
-    return {
-      id: "harness",
-      label: "Harness configured",
-      state: "unverified",
-      hint: `Unknown harness provider "${providerRaw}". Use one of: claude, codex, pi, devin, claude-managed, opencode.`,
-      action_url: "/integrations",
-    };
-  }
-
-  const roll = rollupCredStatusForProvider(providerName);
-
-  if (roll.workers === 0) {
-    return {
-      id: "harness",
-      label: "Harness configured",
-      state: "unverified",
-      hint: `No workers registered for "${providerName}" yet. Start a worker configured for the ${providerName} harness.`,
-      action_url: "/agents",
-      provider: providerName,
-    };
-  }
-
+/**
+ * Compose a one-line, per-provider description for the milestone hint.
+ * Examples:
+ *   "1 worker · live test ok"
+ *   "2 workers · presence ok, awaiting live test"
+ *   "missing: OPENAI_API_KEY"
+ */
+function describeRoll(roll: CredRollup): string {
+  if (roll.workers === 0) return "no workers";
   if (roll.reports === 0) {
+    return `${roll.workers} ${roll.workers === 1 ? "worker" : "workers"}, none reported`;
+  }
+  const w = `${roll.workers} ${roll.workers === 1 ? "worker" : "workers"}`;
+  if (roll.state === "verified") return `${w} · live test ok`;
+  if (roll.state === "configured") return `${w} · presence ok, awaiting live test`;
+  return roll.latestMissing.length > 0
+    ? `missing: ${roll.latestMissing.join(", ")}`
+    : "creds blocked";
+}
+
+/**
+ * Fleet-aware harness milestone.
+ *
+ * Reads the agent fleet (distinct `harness_provider` values reported by
+ * workers via migration 054/055), runs the cred-status rollup per provider,
+ * and aggregates:
+ *
+ *   `verified`  — every provider in the fleet has a fresh passing live test.
+ *   `configured` — every provider has at least `configured`, ≥1 not verified.
+ *   `unverified` — any provider has `unverified` (no reports OR all-blocked).
+ *
+ * Crucially: the API never reads `process.env.HARNESS_PROVIDER` here.
+ * `HARNESS_PROVIDER` is a worker-side env var; the API hosts a fleet that
+ * may run several harnesses simultaneously. Empty fleet → `unverified` with
+ * an onboarding hint.
+ */
+function harnessMilestone(): SetupMilestone {
+  const fleet = getAgentHarnessProviders();
+
+  if (fleet.length === 0) {
     return {
       id: "harness",
       label: "Harness configured",
       state: "unverified",
-      hint: "Workers registered but none have reported credential status yet — they may be booting or have CRED_CHECK_DISABLE=1 set.",
+      hint: "No worker agents registered yet. Start a worker with HARNESS_PROVIDER set to one of: claude, codex, pi, devin, claude-managed, opencode.",
       action_url: "/agents",
-      provider: providerName,
     };
   }
 
-  if (roll.state === "verified") {
+  const perProvider = fleet
+    .map(({ provider }) => {
+      const parsed = ProviderNameSchema.safeParse(provider);
+      if (!parsed.success) return null;
+      return { provider: parsed.data, roll: rollupCredStatusForProvider(parsed.data) };
+    })
+    .filter(
+      (x): x is { provider: z.infer<typeof ProviderNameSchema>; roll: CredRollup } => x !== null,
+    );
+
+  if (perProvider.length === 0) {
     return {
       id: "harness",
       label: "Harness configured",
-      state: "verified",
-      hint: "At least one worker has a passing live test within the verify TTL.",
-      action_url: "/integrations",
-      provider: providerName,
+      state: "unverified",
+      hint: "Registered agents have unrecognised harness_provider values; check the agent rows.",
+      action_url: "/agents",
     };
   }
 
-  if (roll.state === "configured") {
-    return {
-      id: "harness",
-      label: "Harness configured",
-      state: "configured",
-      hint: 'Workers report credentials present — click "Test connection" to surface the latest live test.',
-      action_url: "/integrations",
-      provider: providerName,
-    };
-  }
+  const states = perProvider.map((p) => p.roll.state);
+  const aggregateState: SetupMilestoneState = states.every((s) => s === "verified")
+    ? "verified"
+    : states.every((s) => s !== "unverified")
+      ? "configured"
+      : "unverified";
 
-  // Unverified with reports → workers say creds are missing.
-  const missingHint =
-    roll.latestMissing.length > 0
-      ? `Workers report missing: ${roll.latestMissing.join(", ")}.`
-      : "Workers report missing credentials.";
+  const hint = perProvider.map((p) => `${p.provider}: ${describeRoll(p.roll)}`).join(" · ");
+  const singleProvider = perProvider.length === 1 ? perProvider[0]?.provider : undefined;
+
   return {
     id: "harness",
     label: "Harness configured",
-    state: "unverified",
-    hint: missingHint,
-    action_url: "/integrations",
-    provider: providerName,
+    state: aggregateState,
+    hint,
+    action_url: aggregateState === "unverified" ? "/agents" : "/integrations",
+    provider: singleProvider,
+    providers: perProvider.map((p) => ({
+      provider: p.provider,
+      state: p.roll.state,
+      workers: p.roll.workers,
+    })),
   };
 }
 

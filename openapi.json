@@ -7196,6 +7196,42 @@
                               "claude-managed",
                               "opencode"
                             ]
+                          },
+                          "providers": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "provider": {
+                                  "type": "string",
+                                  "enum": [
+                                    "claude",
+                                    "codex",
+                                    "pi",
+                                    "devin",
+                                    "claude-managed",
+                                    "opencode"
+                                  ]
+                                },
+                                "state": {
+                                  "type": "string",
+                                  "enum": [
+                                    "unverified",
+                                    "configured",
+                                    "verified"
+                                  ]
+                                },
+                                "workers": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                }
+                              },
+                              "required": [
+                                "provider",
+                                "state",
+                                "workers"
+                              ]
+                            }
                           }
                         },
                         "required": [

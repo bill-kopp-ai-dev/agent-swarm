@@ -208,7 +208,6 @@ describe("setup milestones", () => {
   });
 
   test("harness becomes `configured` when a worker reports ready creds (no live test yet)", () => {
-    process.env.HARNESS_PROVIDER = "claude";
     const a = createAgent({ name: "w-cfg", isLead: false, status: "idle", capabilities: [] });
     seedCredStatus(a.id, "claude", { ready: true, satisfiedBy: "env", liveTest: null });
 
@@ -217,7 +216,6 @@ describe("setup milestones", () => {
   });
 
   test("harness flips to `verified` when a worker's recent live test passed", () => {
-    process.env.HARNESS_PROVIDER = "claude";
     const a = createAgent({ name: "w-vfd", isLead: false, status: "idle", capabilities: [] });
     seedCredStatus(a.id, "claude", {
       ready: true,
@@ -229,14 +227,13 @@ describe("setup milestones", () => {
     expect(getMilestone(payload, "harness").state).toBe("verified");
   });
 
-  test("harness stays `unverified` when provider set but no worker registered", () => {
-    process.env.HARNESS_PROVIDER = "claude";
-    const payload = buildStatusPayload();
-    expect(getMilestone(payload, "harness").state).toBe("unverified");
+  test("harness stays `unverified` on an empty fleet (no agents registered)", () => {
+    const m = getMilestone(buildStatusPayload(), "harness");
+    expect(m.state).toBe("unverified");
+    expect(m.hint).toContain("No worker agents registered");
   });
 
   test("harness stays `unverified` when worker reports missing credentials", () => {
-    process.env.HARNESS_PROVIDER = "claude";
     const a = createAgent({ name: "w-miss", isLead: false, status: "idle", capabilities: [] });
     seedCredStatus(a.id, "claude", {
       ready: false,
@@ -250,46 +247,72 @@ describe("setup milestones", () => {
     expect(m.hint).toContain("ANTHROPIC_API_KEY");
   });
 
-  // ─── Phase 1.5: typed provider field on harness milestone ────────────────
-  describe("harness.provider — typed field, no hint regex (Phase 1.5)", () => {
-    test("populates `provider` when HARNESS_PROVIDER is a canonical name", () => {
+  // ─── Multi-provider fleet rollup ─────────────────────────────────────────
+  describe("harness — multi-provider fleet aggregate", () => {
+    test("`verified` when every provider in the fleet has a fresh passing live test", () => {
+      const a = createAgent({ name: "claude-w", isLead: false, status: "idle", capabilities: [] });
+      const b = createAgent({ name: "codex-w", isLead: false, status: "idle", capabilities: [] });
+      const fresh = { ok: true, error: null, latency_ms: 12, testedAt: Date.now() };
+      seedCredStatus(a.id, "claude", { ready: true, satisfiedBy: "env", liveTest: fresh });
+      seedCredStatus(b.id, "codex", { ready: true, satisfiedBy: "file", liveTest: fresh });
+
+      const m = getMilestone(buildStatusPayload(), "harness");
+      expect(m.state).toBe("verified");
+      // Multi-provider fleet → `provider` is undefined; `providers[]` lists both.
+      expect(m.provider).toBeUndefined();
+      const providerNames = (m.providers ?? []).map((p) => p.provider).sort();
+      expect(providerNames).toEqual(["claude", "codex"]);
+    });
+
+    test("`configured` when one provider is verified and another is presence-only", () => {
+      const a = createAgent({ name: "claude-w", isLead: false, status: "idle", capabilities: [] });
+      const b = createAgent({ name: "codex-w", isLead: false, status: "idle", capabilities: [] });
+      seedCredStatus(a.id, "claude", {
+        ready: true,
+        satisfiedBy: "env",
+        liveTest: { ok: true, error: null, latency_ms: 11, testedAt: Date.now() },
+      });
+      seedCredStatus(b.id, "codex", { ready: true, satisfiedBy: "file", liveTest: null });
+
+      const m = getMilestone(buildStatusPayload(), "harness");
+      expect(m.state).toBe("configured");
+      expect(m.hint).toContain("claude");
+      expect(m.hint).toContain("codex");
+    });
+
+    test("`unverified` when any provider in the fleet reports blocked credentials", () => {
+      const a = createAgent({ name: "claude-w", isLead: false, status: "idle", capabilities: [] });
+      const b = createAgent({ name: "pi-w", isLead: false, status: "idle", capabilities: [] });
+      seedCredStatus(a.id, "claude", {
+        ready: true,
+        satisfiedBy: "env",
+        liveTest: { ok: true, error: null, latency_ms: 11, testedAt: Date.now() },
+      });
+      seedCredStatus(b.id, "pi", {
+        ready: false,
+        missing: ["OPENROUTER_API_KEY"],
+        satisfiedBy: null,
+      });
+
+      const m = getMilestone(buildStatusPayload(), "harness");
+      expect(m.state).toBe("unverified");
+      expect(m.hint).toContain("pi");
+      expect(m.hint).toContain("OPENROUTER_API_KEY");
+    });
+
+    test("`provider` populated only on single-provider fleets", () => {
+      const a = createAgent({ name: "lone", isLead: false, status: "idle", capabilities: [] });
+      seedCredStatus(a.id, "claude", { ready: true, satisfiedBy: "env", liveTest: null });
+      expect(getMilestone(buildStatusPayload(), "harness").provider).toBe("claude");
+    });
+
+    test("API process.env.HARNESS_PROVIDER is ignored — fleet wins", () => {
+      // Set a misleading env var on the API process. The milestone should
+      // still be derived from the (empty) agent fleet.
       process.env.HARNESS_PROVIDER = "claude";
-      process.env.ANTHROPIC_API_KEY = "sk-ant-test-1234567890abcdef";
       const m = getMilestone(buildStatusPayload(), "harness");
-      expect(m.provider).toBe("claude");
-    });
-
-    test("undefined when HARNESS_PROVIDER unset", () => {
-      const m = getMilestone(buildStatusPayload(), "harness");
-      expect(m.provider).toBeUndefined();
-    });
-
-    test("undefined when HARNESS_PROVIDER is an unknown name", () => {
-      process.env.HARNESS_PROVIDER = "not-a-real-provider";
-      const m = getMilestone(buildStatusPayload(), "harness");
-      expect(m.provider).toBeUndefined();
-    });
-
-    test("hints never contain HARNESS_PROVIDER= or provider= substrings", () => {
-      // Across all three states we care about: unset, set+missing-creds,
-      // set+creds-present (configured).
-      const cases: Array<() => void> = [
-        () => {},
-        () => {
-          process.env.HARNESS_PROVIDER = "claude";
-        },
-        () => {
-          process.env.HARNESS_PROVIDER = "claude";
-          process.env.ANTHROPIC_API_KEY = "sk-ant-test-1234567890";
-        },
-      ];
-      for (const seed of cases) {
-        clearEnv();
-        seed();
-        const m = getMilestone(buildStatusPayload(), "harness");
-        expect(m.hint ?? "").not.toMatch(/HARNESS_PROVIDER=/);
-        expect(m.hint ?? "").not.toMatch(/provider=/);
-      }
+      expect(m.state).toBe("unverified");
+      expect(m.hint).toContain("No worker agents registered");
     });
   });
 
@@ -682,17 +705,14 @@ describe("computeHealth (Phase 2)", () => {
     expect(payload.health).toBe("broken");
   });
 
-  test("`broken` when harness has creds but no workers ever joined", () => {
-    process.env.HARNESS_PROVIDER = "claude";
-    process.env.ANTHROPIC_API_KEY = "sk-ant-test-1234567890";
+  test("`broken` when no agents ever joined (harness fleet is empty)", () => {
     const payload = buildStatusPayload();
-    // Harness flips to `configured`, workers still `unverified` → broken.
+    // Both harness and workers are `unverified` on a clean swarm → broken.
     expect(payload.health).toBe("broken");
+    expect(getMilestone(payload, "harness").state).toBe("unverified");
   });
 
   test("`degraded` when harness is `configured` (worker reported ready, no live test) and workers verified", () => {
-    process.env.HARNESS_PROVIDER = "claude";
-
     const lead = createAgent({ name: "lead-h", isLead: true, status: "idle", capabilities: [] });
     const worker = createAgent({
       name: "worker-h",
@@ -702,7 +722,8 @@ describe("computeHealth (Phase 2)", () => {
     });
     updateAgentActivity(lead.id);
     updateAgentActivity(worker.id);
-    // Worker reports presence-ok but no live test → harness is `configured`.
+    // Both report presence-ok with no live test → harness rollup is `configured`.
+    seedCredStatus(lead.id, "claude", { ready: true, satisfiedBy: "env", liveTest: null });
     seedCredStatus(worker.id, "claude", { ready: true, satisfiedBy: "env", liveTest: null });
 
     const payload = buildStatusPayload();
@@ -712,8 +733,6 @@ describe("computeHealth (Phase 2)", () => {
   });
 
   test("`degraded` when workers are `configured` (agents exist, no recent heartbeat)", () => {
-    process.env.HARNESS_PROVIDER = "claude";
-
     const lead = createAgent({ name: "lead-d", isLead: true, status: "idle", capabilities: [] });
     // No updateAgentActivity → workers row stays `configured`, not `verified`.
     // Seed lead's cred_status as `verified` (live test passed) so harness
