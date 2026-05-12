@@ -66,9 +66,6 @@ const DIRECT_MODELS: Record<"claude" | "codex", ModelOption[]> = {
     { id: "claude-opus-4-7", label: "Claude Opus 4.7", ...ANTHROPIC_META },
     { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", ...ANTHROPIC_META },
     { id: "claude-haiku-4-5", label: "Claude Haiku 4.5", ...ANTHROPIC_META },
-    { id: "opus", label: "Opus shortname", ...ANTHROPIC_META },
-    { id: "sonnet", label: "Sonnet shortname", ...ANTHROPIC_META },
-    { id: "haiku", label: "Haiku shortname", ...ANTHROPIC_META },
   ],
   codex: [
     { id: "gpt-5.4", label: "GPT-5.4", ...OPENAI_META },
@@ -166,6 +163,15 @@ export function findModelOption(
   return null;
 }
 
+// CLI shortnames Anthropic ships in their tools (`--model opus`, etc.). Workers
+// may report these verbatim — we map them to the canonical id so the row reads
+// "Claude Sonnet 4.6" instead of a bare "sonnet".
+const ANTHROPIC_SHORTNAME_TO_ID: Record<string, string> = {
+  opus: "claude-opus-4-7",
+  sonnet: "claude-sonnet-4-6",
+  haiku: "claude-haiku-4-5",
+};
+
 /**
  * Stateless lookup across every known harness/snapshot — for read-only surfaces
  * (agent list, telemetry rows) that don't have configs/env presence in scope.
@@ -173,8 +179,9 @@ export function findModelOption(
  */
 export function findKnownModel(model: string | null | undefined): ModelOption | null {
   if (!model) return null;
+  const aliased = ANTHROPIC_SHORTNAME_TO_ID[model] ?? model;
   for (const arr of Object.values(DIRECT_MODELS)) {
-    const found = arr.find((m) => m.id === model);
+    const found = arr.find((m) => m.id === aliased);
     if (found) return found;
   }
   for (const providerId of SNAPSHOT_ORDER) {
@@ -195,8 +202,29 @@ export function findKnownModel(model: string | null | undefined): ModelOption | 
         contextWindow: cached.limit?.context,
       };
     }
+    // Provider prefix matched but model not in the snapshot (e.g. brand-new
+    // OpenRouter route). Still surface the provider logo + a tidier label
+    // by humanizing the tail instead of falling back to the raw composite id.
+    return {
+      id: model,
+      label: humanizeModelTail(tail),
+      provider: meta.label,
+      providerId: meta.iconKey,
+      requiredKey: meta.requiredKey,
+    };
   }
   return null;
+}
+
+/**
+ * Best-effort prettifier for model ids not in the snapshot cache. Drops the
+ * vendor prefix segment (`qwen/qwen3.6-35b-a3b` → `qwen3.6-35b-a3b`) and
+ * upper-cases the leading letter so it reads like a name.
+ */
+function humanizeModelTail(tail: string): string {
+  const last = tail.split("/").pop() ?? tail;
+  if (!last) return tail;
+  return last.charAt(0).toUpperCase() + last.slice(1);
 }
 
 export function pickDefaultModelForHarness(
