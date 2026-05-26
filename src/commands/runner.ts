@@ -57,6 +57,11 @@ import {
   reportCredStatus,
   reportLatestModel,
 } from "./provider-credentials.ts";
+import {
+  type ResumeSessionCandidate,
+  type ResumeSessionResolution,
+  resolveResumeSession,
+} from "./resume-session.ts";
 // Side-effect import: registers runner trigger/resumption templates
 import "./templates.ts";
 
@@ -994,6 +999,8 @@ async function getPausedTasksFromAPI(config: ApiConfig): Promise<
     task: string;
     progress?: string;
     claudeSessionId?: string;
+    provider?: ProviderName;
+    providerMeta?: Record<string, unknown>;
     parentTaskId?: string;
     dir?: string;
     vcsRepo?: string;
@@ -1026,6 +1033,8 @@ async function getPausedTasksFromAPI(config: ApiConfig): Promise<
         task: string;
         progress?: string;
         claudeSessionId?: string;
+        provider?: ProviderName;
+        providerMeta?: Record<string, unknown>;
         parentTaskId?: string;
         dir?: string;
         vcsRepo?: string;
@@ -1428,21 +1437,48 @@ async function saveProviderSessionIdOnActiveSession(
   });
 }
 
-/** Fetch Claude session ID for a task (for --resume) */
-async function fetchProviderSessionId(
+interface ProviderSessionInfo {
+  sessionId: string | null;
+  provider?: ProviderName;
+  providerMeta?: Record<string, unknown>;
+}
+
+/** Fetch provider session metadata for a task (for resume continuity). */
+async function fetchProviderSessionInfo(
   apiUrl: string,
   apiKey: string,
   taskId: string,
-): Promise<string | null> {
+): Promise<ProviderSessionInfo | null> {
   const headers: Record<string, string> = {};
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
   try {
     const response = await fetch(`${apiUrl}/api/tasks/${taskId}`, { headers });
     if (!response.ok) return null;
-    const data = (await response.json()) as { claudeSessionId?: string };
-    return data.claudeSessionId || null;
+    const data = (await response.json()) as {
+      claudeSessionId?: string;
+      provider?: ProviderName;
+      providerMeta?: Record<string, unknown>;
+    };
+    return {
+      sessionId: data.claudeSessionId || null,
+      provider: data.provider,
+      providerMeta: data.providerMeta,
+    };
   } catch {
     return null;
+  }
+}
+
+function logResumeResolution(role: string, resolution: ResumeSessionResolution): void {
+  for (const skipped of resolution.skipped) {
+    console.warn(
+      `[${role}] Skipping ${skipped.source} session resume ${skipped.sessionId.slice(0, 8)}: ${skipped.reason}`,
+    );
+  }
+
+  if (resolution.resumeSessionId) {
+    const source = resolution.source === "parent" ? "parent session" : "task's own session";
+    console.log(`[${role}] Resuming ${source} ${resolution.resumeSessionId.slice(0, 8)}`);
   }
 }
 
@@ -2106,6 +2142,7 @@ async function spawnProviderProcess(
     iteration: number;
     taskId?: string;
     model?: string;
+    resumeSessionId?: string;
     harnessProvider: ProviderName;
     cwd?: string;
     vcsRepo?: string;
@@ -2171,6 +2208,7 @@ async function spawnProviderProcess(
     vcsRepo: opts.vcsRepo,
     logFile: opts.logFile,
     additionalArgs: opts.additionalArgs,
+    resumeSessionId: opts.resumeSessionId,
     iteration: opts.iteration,
     env: freshEnv as Record<string, string>,
     // Propagate the selected OAuth slot so the adapter refreshes back to the
@@ -3714,18 +3752,30 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           console.log(`[${role}] Injected relevant memories into resumed task prompt`);
         }
 
-        // Resolve --resume: prefer own session ID, then parent's
-        let resumeAdditionalArgs = opts.additionalArgs || [];
-        if (task.claudeSessionId) {
-          resumeAdditionalArgs = [...resumeAdditionalArgs, "--resume", task.claudeSessionId];
-          console.log(`[${role}] Resuming task's own session ${task.claudeSessionId.slice(0, 8)}`);
-        } else if (task.parentTaskId) {
-          const parentSessionId = await fetchProviderSessionId(apiUrl, apiKey, task.parentTaskId);
-          if (parentSessionId) {
-            resumeAdditionalArgs = [...resumeAdditionalArgs, "--resume", parentSessionId];
-            console.log(`[${role}] Resuming parent session ${parentSessionId.slice(0, 8)}`);
+        // Resolve provider-aware resume: prefer own session, then parent.
+        const resumeCandidates: ResumeSessionCandidate[] = [
+          {
+            source: "task",
+            taskId: task.id,
+            sessionId: task.claudeSessionId,
+            provider: task.provider,
+            providerMeta: task.providerMeta,
+          },
+        ];
+        if (task.parentTaskId) {
+          const parentSession = await fetchProviderSessionInfo(apiUrl, apiKey, task.parentTaskId);
+          if (parentSession?.sessionId) {
+            resumeCandidates.push({
+              source: "parent",
+              taskId: task.parentTaskId,
+              sessionId: parentSession.sessionId,
+              provider: parentSession.provider,
+              providerMeta: parentSession.providerMeta,
+            });
           }
         }
+        const resumeResolution = resolveResumeSession(state.harnessProvider, resumeCandidates);
+        logResumeResolution(role, resumeResolution);
 
         // Spawn Claude process for resumed task
         iteration++;
@@ -3791,7 +3841,8 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
               prompt: resumePrompt,
               logFile,
               systemPrompt: resolvedSystemPrompt,
-              additionalArgs: resumeAdditionalArgs,
+              additionalArgs: opts.additionalArgs,
+              resumeSessionId: resumeResolution.resumeSessionId,
               role,
               apiUrl,
               apiKey,
@@ -4056,20 +4107,27 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           }
         }
 
-        // Resolve --resume for child tasks with parentTaskId
-        let effectiveAdditionalArgs = opts.additionalArgs || [];
+        // Resolve provider-aware resume for child tasks with parentTaskId.
+        let resumeSessionId: string | undefined;
         const taskObj = trigger.task as { parentTaskId?: string } | undefined;
         if (taskObj?.parentTaskId) {
-          const parentSessionId = await fetchProviderSessionId(
+          const parentSession = await fetchProviderSessionInfo(
             apiUrl,
             apiKey,
             taskObj.parentTaskId,
           );
-          if (parentSessionId) {
-            effectiveAdditionalArgs = [...effectiveAdditionalArgs, "--resume", parentSessionId];
-            console.log(
-              `[${role}] Child task — resuming parent session ${parentSessionId.slice(0, 8)}`,
-            );
+          if (parentSession?.sessionId) {
+            const resumeResolution = resolveResumeSession(state.harnessProvider, [
+              {
+                source: "parent",
+                taskId: taskObj.parentTaskId,
+                sessionId: parentSession.sessionId,
+                provider: parentSession.provider,
+                providerMeta: parentSession.providerMeta,
+              },
+            ]);
+            logResumeResolution(role, resumeResolution);
+            resumeSessionId = resumeResolution.resumeSessionId;
           } else {
             console.log(`[${role}] Child task — parent session ID not found, starting fresh`);
           }
@@ -4208,7 +4266,8 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
               prompt: triggerPrompt,
               logFile,
               systemPrompt: taskSystemPrompt,
-              additionalArgs: effectiveAdditionalArgs,
+              additionalArgs: opts.additionalArgs,
+              resumeSessionId,
               role,
               apiUrl,
               apiKey,

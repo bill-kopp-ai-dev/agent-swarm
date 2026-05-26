@@ -214,7 +214,14 @@ export class SessionErrorTracker {
 
   /** Check if the failure was due to a missing/stale session ID */
   isSessionNotFound(): boolean {
-    return this.errors.some((e) => e.message.includes("No conversation found with session ID"));
+    return this.errors.some((e) => {
+      const message = e.message.toLowerCase();
+      return (
+        message.includes("no conversation found with session id") ||
+        (message.includes("--resume requires a valid session id") &&
+          message.includes("does not match any session title"))
+      );
+    });
   }
 
   getErrors(): ReadonlyArray<ErrorSignal> {

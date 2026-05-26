@@ -90,6 +90,23 @@ describe("SessionErrorTracker", () => {
     expect(errors[0]!.type).toBe("stderr_error");
     expect(errors[0]!.message).toBe("fatal: connection refused");
   });
+
+  test("detects Claude CLI invalid --resume session errors as stale sessions", () => {
+    const tracker = new SessionErrorTracker();
+    trackErrorFromJson(
+      {
+        type: "result",
+        subtype: "error_during_execution",
+        is_error: true,
+        errors: [
+          'Error during execution: Error: --resume requires a valid session ID or session title when used with --print. Usage: claude -p --resume <session-id|title>. Provided value "ses_19c145de3ffeD9qLlntj8SRO28" is not a UUID and does not match any session title.',
+        ],
+      },
+      tracker,
+    );
+
+    expect(tracker.isSessionNotFound()).toBe(true);
+  });
 });
 
 describe("buildFailureReason", () => {
