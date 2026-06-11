@@ -5,7 +5,7 @@
 //   WTS_WORKTREE_PATH - path to the new worktree (also the working directory)
 //   WTS_GIT_ROOT      - path to the main repository root
 
-import { exists, readFile, writeFile } from "node:fs/promises";
+import { exists, readFile, rm, writeFile } from "node:fs/promises";
 import { join, basename } from "node:path";
 
 const worktreePath = process.env.WTS_WORKTREE_PATH!;
@@ -138,7 +138,8 @@ const targetClaude = join(worktreePath, ".claude");
 
 if (await exists(mainClaude)) {
   console.log("Copying .claude directory...");
-  await Bun.$`rm -rf ${targetClaude} && cp -r ${mainClaude} ${targetClaude}`;
+  await rm(targetClaude, { recursive: true, force: true });
+  await Bun.$`cp -r ${mainClaude} ${targetClaude}`;
 }
 
 // --- Copy .business-use directory (BU config + DB) ---
