@@ -41,12 +41,24 @@
   "config": {
     "name": "agent-swarm"
   },
+  "packageManager": "bun@1.3.11",
+  "workspaces": ["ui", "templates-ui", "evals", "packages/*"],
+  "overrides": {
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
+  "trustedDependencies": ["esbuild", "unrs-resolver"],
   "scripts": {
     "build:pi-skills": "bun run plugin/build-pi-skills.ts",
     "build:cli": "bun run scripts/build-cli.ts",
+    "mono:build": "turbo run build",
+    "mono:test": "turbo run test",
+    "mono:lint": "turbo run lint",
+    "mono:dev": "turbo run dev",
     "prepack": "bun run build:cli",
     "tsc:check": "bun tsc --noEmit",
     "check:db-boundary": "bash scripts/check-db-boundary.sh",
+    "check:dep-graph": "depcruise src plugin/opencode-plugins --config .dependency-cruiser.cjs",
     "check:api-key-boundary": "bash scripts/check-api-key-boundary.sh",
     "check:audit-columns": "bash scripts/check-audit-columns.sh",
     "lint:structure": "konsistent check",
@@ -101,7 +113,10 @@
     "@faker-js/faker": "^10.4.0",
     "@opencode-ai/plugin": "1.17.4",
     "@types/bun": "latest",
-    "konsistent": "1.0.0-beta.1"
+    "dependency-cruiser": "^18.0.0",
+    "konsistent": "1.0.0-beta.1",
+    "ts-morph": "^28.0.0",
+    "turbo": "^2.10.0"
   },
   "peerDependencies": {
     "typescript": "^5"
@@ -145,7 +160,7 @@
     "ink": "^6.5.1",
     "oauth4webapi": "^3.8.5",
     "openai": "^6.22.0",
-    "react": "^19.2.3",
+    "react": "19.2.3",
     "react-devtools-core": "^7.0.1",
     "sqlite-vec": "^0.1.9",
     "svix": "^1.62.0",

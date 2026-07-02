@@ -22,18 +22,20 @@ CI detects what changed and runs the matching jobs:
 
 | Job | Local equivalent | Common failure |
 |---|---|---|
-| **Lint and Type Check** | `bun run lint && bun run tsc:check && bash scripts/check-db-boundary.sh` | Worker code imported `bun:sqlite` or `src/be/db` — DB boundary violation |
+| **Lint and Type Check** | `bun run lint && bun run tsc:check && bash scripts/check-db-boundary.sh && bun run check:dep-graph` | Worker code imported `bun:sqlite` or `src/be/db` — DB boundary violation (grep + dependency-cruiser graph rules) |
 | **Run Tests** | `bun test` | New test or test that depends on undocumented setup |
 | **Pi-Skills Freshness** | `bun run build:pi-skills` (must produce zero diff in `plugin/pi-skills/`) | Edited `plugin/commands/*.md` without rebuilding |
 | **OpenAPI Spec Freshness** | `bun run docs:openapi` (must produce zero diff in `openapi.json` AND `docs-site/content/docs/api-reference/`) | Edited an HTTP route or bumped `package.json` `version` without regenerating |
 | **Raw matchRoute check** | `! grep -rn 'matchRoute(' src/http/ --include='*.ts' \| grep -v 'route-def.ts' \| grep -v 'utils.ts'` | Used `matchRoute` directly instead of the `route()` factory |
-| **Docker Build (Dockerfile + Dockerfile.worker)** | `docker build -f Dockerfile . && docker build -f Dockerfile.worker .` | Broken multi-stage build, missing file in the worker context |
+| **Docker Build (Dockerfile + Dockerfile.worker + evals/Dockerfile)** | `docker build -f Dockerfile . && docker build -f Dockerfile.worker . && docker build -f evals/Dockerfile .` | Broken multi-stage build, missing file in the worker context, evals image drifting from the root workspace lockfile |
 
-### When `ui/` changed
+### When `ui/` changed (or root `bun.lock` / `package.json` / `bunfig.toml`)
+
+ui's dependency tree resolves from the **root** lockfile since the workspace migration, so root dep changes also trigger this job.
 
 | Job | Local equivalent (run from `ui/`) |
 |---|---|
-| **UI Lint and Type Check** | `pnpm install --frozen-lockfile && pnpm lint && pnpm exec tsc -b` |
+| **UI Lint and Type Check** | `bun install --frozen-lockfile && bun run lint && bunx tsc -b` |
 
 > **Note:** CI uses `tsc -b` (project-references build mode), **not** `tsc --noEmit`. Use `tsc -b` locally to match.
 
@@ -48,16 +50,18 @@ bun run lint            # NOT lint:fix — CI fails on warnings, not just errors
 bun run tsc:check
 bun test
 bash scripts/check-db-boundary.sh
+bun run check:dep-graph
 
 # Drift checks (run if you touched the relevant files)
 bun run build:pi-skills && git diff --quiet plugin/pi-skills/ || echo "pi-skills drift — commit the regenerated files"
 bun run docs:openapi    && git diff --quiet openapi.json docs-site/content/docs/api-reference/ || echo "openapi drift — commit the regenerated files"
 
-# Docker (only if you touched Dockerfile, Dockerfile.worker, or anything they COPY)
-docker build -f Dockerfile . && docker build -f Dockerfile.worker .
+# Docker (if you touched any Dockerfile, evals/, .dockerignore, bunfig.toml,
+# root/member package.json, bun.lock, or anything the Dockerfiles COPY)
+docker build -f Dockerfile . && docker build -f Dockerfile.worker . && docker build -f evals/Dockerfile .
 
-# ui (only if you touched ui/)
-( cd ui && pnpm install --frozen-lockfile && pnpm lint && pnpm exec tsc -b )
+# ui (if you touched ui/ — or root bun.lock/package.json/bunfig.toml, since ui deps resolve from the root lock)
+( cd ui && bun install --frozen-lockfile && bun run lint && bunx tsc -b )
 ```
 
 ## Why CI fails (in order of frequency)
@@ -72,9 +76,9 @@ docker build -f Dockerfile . && docker build -f Dockerfile.worker .
 
 ## Lockfile discipline
 
-CI uses `bun install --frozen-lockfile` (and `pnpm install --frozen-lockfile` for `ui/`). This means:
+CI uses `bun install --frozen-lockfile`. A single root install now covers `ui/`, `templates-ui/`, and `evals/` as Bun workspace members. This means:
 
-- **Adding/upgrading a dep:** run `bun install <pkg>` (or `pnpm add` in `ui/`), then commit BOTH `package.json` AND `bun.lock` (or `pnpm-lock.yaml`).
+- **Adding/upgrading a dep:** run `bun install <pkg>` (in the relevant workspace dir), then commit BOTH `package.json` AND the root `bun.lock`.
 - **Cloning fresh / switching branches:** run `bun install --frozen-lockfile` to mirror CI. If it errors, the lockfile is stale — `bun install` (without `--frozen-lockfile`) and commit the result.
 - **Never edit lockfiles by hand.**
 
