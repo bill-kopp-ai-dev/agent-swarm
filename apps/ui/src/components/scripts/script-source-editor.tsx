@@ -11,9 +11,12 @@ const STDLIB_LIB_URI = "file:///stdlib.d.ts";
 /**
  * Register the swarm SDK + stdlib `.d.ts` as TypeScript extra libs so Monaco's
  * TS worker resolves SDK symbols and shows real inferred types on hover.
- * `typescriptDefaults` is a Monaco-global singleton — guard against duplicate
- * registration across mounts (each addExtraLib call would otherwise stack a
- * new lib version and re-trigger worker syncs).
+ * `typescriptDefaults` is a Monaco-global singleton — only (re)register a lib
+ * when its content actually changed (each addExtraLib call would otherwise
+ * stack a new lib version and re-trigger worker syncs). Content can change
+ * between fetches: the stdlib blob embeds the generated per-connection
+ * `ScriptApiRegistry` / `ScriptMcpRegistry` types, which grow as connections
+ * are added.
  */
 function registerScriptTypeDefs(monaco: Monaco, typeDefs: ScriptTypeDefs) {
   const tsDefaults = monaco.languages.typescript.typescriptDefaults;
@@ -26,15 +29,22 @@ function registerScriptTypeDefs(monaco: Monaco, typeDefs: ScriptTypeDefs) {
     strict: false,
   });
   const existing = tsDefaults.getExtraLibs();
-  if (!existing[SDK_LIB_URI]) tsDefaults.addExtraLib(typeDefs.sdkTypes, SDK_LIB_URI);
-  if (!existing[STDLIB_LIB_URI]) tsDefaults.addExtraLib(typeDefs.stdlibTypes, STDLIB_LIB_URI);
+  if (existing[SDK_LIB_URI]?.content !== typeDefs.sdkTypes) {
+    tsDefaults.addExtraLib(typeDefs.sdkTypes, SDK_LIB_URI);
+  }
+  if (existing[STDLIB_LIB_URI]?.content !== typeDefs.stdlibTypes) {
+    tsDefaults.addExtraLib(typeDefs.stdlibTypes, STDLIB_LIB_URI);
+  }
 }
 
 interface ScriptSourceEditorProps {
   source: string;
+  onChange?: (source: string) => void;
   /** SDK + stdlib `.d.ts` from `GET /api/scripts/type-defs`; optional while loading. */
   typeDefs?: ScriptTypeDefs;
+  readOnly?: boolean;
   className?: string;
+  height?: string;
 }
 
 /**
@@ -43,7 +53,14 @@ interface ScriptSourceEditorProps {
  * types (LSP-like quick info). Self-contained — the Versions tab reuses it
  * with a different `source`.
  */
-export function ScriptSourceEditor({ source, typeDefs, className }: ScriptSourceEditorProps) {
+export function ScriptSourceEditor({
+  source,
+  onChange,
+  typeDefs,
+  readOnly = true,
+  className,
+  height = "100%",
+}: ScriptSourceEditorProps) {
   const { theme } = useTheme();
   const monacoRef = useRef<Monaco | null>(null);
 
@@ -69,11 +86,12 @@ export function ScriptSourceEditor({ source, typeDefs, className }: ScriptSource
         language="typescript"
         theme={theme === "dark" ? "github-dark" : "github-light"}
         value={source}
+        onChange={(value) => onChange?.(value ?? "")}
         beforeMount={handleBeforeMount}
-        height="100%"
+        height={height}
         width="100%"
         options={{
-          readOnly: true,
+          readOnly,
           minimap: { enabled: false },
           scrollBeyondLastLine: false,
           fontSize: 12,
@@ -84,6 +102,9 @@ export function ScriptSourceEditor({ source, typeDefs, className }: ScriptSource
           renderLineHighlight: "none",
           scrollbar: { vertical: "auto", horizontal: "auto" },
           overviewRulerLanes: 0,
+          // Fixed-position suggest/hover widgets so they escape
+          // overflow-hidden ancestors (cards, dialogs) instead of clipping.
+          fixedOverflowWidgets: true,
         }}
       />
     </div>

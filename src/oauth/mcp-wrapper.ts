@@ -96,6 +96,21 @@ export function assertUrlSafe(rawUrl: string, opts: SsrfGuardOptions = {}): URL 
   return parsed;
 }
 
+export function publicEndpointSsrfOptions(): SsrfGuardOptions {
+  // Fail closed: NODE_ENV is typically UNSET in the production image (Bun
+  // does not default it), so only an explicit development/test environment —
+  // or the explicit override flag — may fetch private/insecure endpoints.
+  // Local dev entrypoints (`bun run dev:http` / `start:http`) set
+  // NODE_ENV=development.
+  const env = process.env.NODE_ENV;
+  const dev =
+    env === "development" || env === "test" || process.env.ALLOW_PRIVATE_NETWORK_URLS === "true";
+  return {
+    allowPrivateHosts: dev,
+    allowInsecure: dev,
+  };
+}
+
 function defaultSsrfOptions(): SsrfGuardOptions {
   return {
     allowPrivateHosts: process.env.MCP_OAUTH_ALLOW_PRIVATE_HOSTS === "true",

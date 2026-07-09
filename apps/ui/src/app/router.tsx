@@ -31,6 +31,9 @@ const RepoDetailPage = lazy(() => import("@/pages/repos/[id]/page"));
 const WorkflowsPage = lazy(() => import("@/pages/workflows/page"));
 const WorkflowDetailPage = lazy(() => import("@/pages/workflows/[id]/page"));
 const WorkflowRunDetailPage = lazy(() => import("@/pages/workflow-runs/[id]/page"));
+const ScriptConnectionsPage = lazy(() => import("@/pages/connections/page"));
+const ScriptConnectionDetailPage = lazy(() => import("@/pages/connections/[id]/page"));
+const OAuthAppDetailPage = lazy(() => import("@/pages/connections/oauth-apps/[provider]/page"));
 const ScriptsPage = lazy(() => import("@/pages/scripts/page"));
 const ScriptDetailPage = lazy(() => import("@/pages/scripts/[id]/page"));
 const ScriptRunDetailPage = lazy(() => import("@/pages/script-runs/[id]/page"));
@@ -107,6 +110,9 @@ export const router = createBrowserRouter([
       { path: "workflows", element: <WorkflowsPage /> },
       { path: "workflows/:id", element: <WorkflowDetailPage /> },
       { path: "workflow-runs/:id", element: <WorkflowRunDetailPage /> },
+      { path: "connections", element: <ScriptConnectionsPage /> },
+      { path: "connections/oauth-apps/:provider", element: <OAuthAppDetailPage /> },
+      { path: "connections/:id", element: <ScriptConnectionDetailPage /> },
       { path: "scripts", element: <ScriptsPage /> },
       { path: "scripts/:id", element: <ScriptDetailPage /> },
       { path: "script-runs/:id", element: <ScriptRunDetailPage /> },

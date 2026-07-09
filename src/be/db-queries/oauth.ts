@@ -113,6 +113,7 @@ export function storeOAuthTokens(
     scope?: string | null;
   },
 ): void {
+  // TODO(secrets-cipher): encrypt OAuth tokens at rest with src/be/crypto/secrets-cipher.ts.
   getDb()
     .query(
       `INSERT INTO oauth_tokens (provider, accessToken, refreshToken, expiresAt, scope)
@@ -168,6 +169,47 @@ export function updateOAuthTokensAfterRefresh(
     );
   }
   throw new Error(`OAuth token refresh persistence failed for ${provider}: no rows updated`);
+}
+
+/**
+ * Presence-flags-only projection of oauth_tokens for the background refresh
+ * sweep. Deliberately excludes token values so sweep code can never leak
+ * them into logs.
+ */
+export type OAuthTokenSweepRow = {
+  provider: string;
+  hasApp: boolean;
+  hasRefreshToken: boolean;
+  expiresAt: string;
+  updatedAt: string;
+};
+
+export function listOAuthTokenSweepRows(): OAuthTokenSweepRow[] {
+  const rows = getDb()
+    .query(
+      `SELECT t.provider,
+              CASE WHEN a.provider IS NOT NULL THEN 1 ELSE 0 END AS hasApp,
+              CASE WHEN t.refreshToken IS NOT NULL AND t.refreshToken != '' THEN 1 ELSE 0 END AS hasRefreshToken,
+              t.expiresAt,
+              t.updatedAt
+       FROM oauth_tokens t
+       LEFT JOIN oauth_apps a ON a.provider = t.provider
+       ORDER BY t.provider ASC`,
+    )
+    .all() as Array<{
+    provider: string;
+    hasApp: number;
+    hasRefreshToken: number;
+    expiresAt: string;
+    updatedAt: string;
+  }>;
+  return rows.map((row) => ({
+    provider: row.provider,
+    hasApp: row.hasApp === 1,
+    hasRefreshToken: row.hasRefreshToken === 1,
+    expiresAt: normalizeDateRequired(row.expiresAt),
+    updatedAt: normalizeDateRequired(row.updatedAt),
+  }));
 }
 
 export function deleteOAuthTokens(provider: string): void {

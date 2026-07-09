@@ -1150,6 +1150,274 @@ export interface ScriptsResponse {
   scripts: ScriptListItem[];
 }
 
+// Script connections (`ctx.api.<slug>` / `ctx.mcp.<slug>`)
+export type ScriptConnectionKind = "openapi" | "graphql" | "mcp";
+export type ScriptConnectionScope = "global" | "agent" | "repo";
+export type OAuthBindingTokenStatus = "ok" | "expiring" | "missing";
+export type CredentialAuthKind = "config" | "oauth";
+
+export interface ScriptCredentialBinding {
+  id: string;
+  configKey: string;
+  allowedHosts: string[];
+  headerTemplate?: string;
+  queryTemplate?: string;
+  scope: ScriptConnectionScope;
+  scopeId: string | null;
+  active: boolean;
+  authKind: CredentialAuthKind;
+  oauthProvider?: string;
+  source?: "default" | "user" | "migration";
+  tokenStatus?: OAuthBindingTokenStatus;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string | null;
+  updatedBy: string | null;
+}
+
+export interface ScriptConnectionCredentialSummary {
+  id: string;
+  configKey: string;
+  authKind: CredentialAuthKind;
+  oauthProvider?: string;
+  tokenStatus?: OAuthBindingTokenStatus;
+}
+
+export interface ScriptConnection {
+  id: string;
+  slug: string;
+  displayName: string | null;
+  kind: ScriptConnectionKind;
+  scope: ScriptConnectionScope;
+  scopeId: string | null;
+  baseUrl: string | null;
+  allowedHosts: string[];
+  credentialBindingId: string | null;
+  credentialBinding: ScriptConnectionCredentialSummary | null;
+  openapiSpecSourceKind: "url" | "inline" | "agent_fs" | null;
+  openapiSpecSource: string | null;
+  openapiSpecEtag: string | null;
+  openapiSpecFetchedAt: string | null;
+  mcpServerId: string | null;
+  generatedAt: string | null;
+  generationError: string | null;
+  operationCount: number;
+  toolCount: number;
+  enabled: boolean;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string | null;
+  updatedBy: string | null;
+}
+
+export interface ScriptConnectionOperationParameter {
+  name: string;
+  in: string;
+  required: boolean;
+  schema?: unknown;
+}
+
+export interface ScriptConnectionOperation {
+  name: string;
+  method: string;
+  path: string;
+  parameters?: ScriptConnectionOperationParameter[];
+  hasBody?: boolean;
+  successStatus?: string;
+  requestBodySchema?: unknown;
+  responseSchema?: unknown;
+}
+
+export interface ScriptConnectionTool {
+  name: string;
+  description?: string;
+  inputSchema?: unknown;
+}
+
+export interface ScriptConnectionDetail extends ScriptConnection {
+  operations: ScriptConnectionOperation[];
+  tools: ScriptConnectionTool[];
+  graphql: boolean;
+  generatedTypes: string;
+  specSummary?: { title?: string; version?: string; pathCount: number };
+  specPreview?: { json: string; truncated: boolean };
+}
+
+export interface ScriptConnectionsResponse {
+  connections: ScriptConnection[];
+}
+
+export interface ScriptConnectionDetailResponse {
+  connection: ScriptConnectionDetail;
+}
+
+export type UpsertScriptConnectionInput =
+  | {
+      id?: string;
+      kind: "openapi";
+      slug: string;
+      displayName?: string;
+      scope?: ScriptConnectionScope;
+      scopeId?: string | null;
+      baseUrl: string;
+      allowedHosts?: string[];
+      credentialBindingId?: string | null;
+      configKey?: string;
+      headerTemplate?: string;
+      queryTemplate?: string;
+      authKind?: CredentialAuthKind;
+      oauthProvider?: string;
+      openapiSpecUrl?: string;
+      openapiSpecJson?: string;
+      enabled?: boolean;
+    }
+  | {
+      id?: string;
+      kind: "graphql";
+      slug: string;
+      displayName?: string;
+      scope?: ScriptConnectionScope;
+      scopeId?: string | null;
+      baseUrl: string;
+      allowedHosts: string[];
+      credentialBindingId?: string | null;
+      configKey?: string;
+      headerTemplate?: string;
+      queryTemplate?: string;
+      authKind?: CredentialAuthKind;
+      oauthProvider?: string;
+      enabled?: boolean;
+    }
+  | {
+      id?: string;
+      kind: "mcp";
+      slug: string;
+      displayName?: string;
+      scope?: ScriptConnectionScope;
+      scopeId?: string | null;
+      mcpServerId: string;
+      enabled?: boolean;
+    };
+
+export interface UpsertCredentialBindingInput {
+  id?: string;
+  configKey: string;
+  allowedHosts: string[];
+  headerTemplate?: string;
+  queryTemplate?: string;
+  scope?: ScriptConnectionScope;
+  scopeId?: string | null;
+  active?: boolean;
+  authKind?: CredentialAuthKind;
+  oauthProvider?: string;
+}
+
+export interface OAuthAppSummary {
+  id: string;
+  provider: string;
+  clientId: string;
+  authorizeUrl: string;
+  tokenUrl: string;
+  redirectUri: string;
+  scopes: string[];
+  extraParams?: Record<string, string>;
+  tokenAuthStyle: "body" | "basic";
+  tokenBodyFormat: "form" | "json";
+  tokenStatus: OAuthBindingTokenStatus;
+  expiresAt?: string | null;
+  lastRefreshedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UpsertOAuthAppInput {
+  provider: string;
+  clientId: string;
+  clientSecret?: string;
+  authorizeUrl: string;
+  tokenUrl: string;
+  scopes?: string[];
+  extraParams?: Record<string, string>;
+  tokenAuthStyle?: "body" | "basic";
+  tokenBodyFormat?: "form" | "json";
+}
+
+export interface OAuthAppDiscoveryResult {
+  authorizeUrl: string;
+  tokenUrl: string;
+  scopes: string[];
+  sourceUrl: string;
+}
+
+export interface IntegrationsCatalogEntry {
+  id: string;
+  kind: ScriptConnectionKind;
+  slug: string;
+  name: string;
+  description: string;
+  url: string;
+  icon: string | null;
+  domain: string;
+  categories: string[];
+  /** Upstream catalog feeds; "apis-guru" marks bulk-imported entries. */
+  feeds?: string[];
+}
+
+export interface IntegrationsCatalogResponse {
+  entries: IntegrationsCatalogEntry[];
+  cachedAt: string;
+}
+
+// Trimmed integrations.sh per-domain surface details, proxied by
+// GET /api/integrations-catalog/{domain}/surface.
+export interface IntegrationsSurfaceMechanics {
+  in: string;
+  headerName: string | null;
+  scheme: string | null;
+}
+
+export interface IntegrationsSurfaceEntry {
+  type: string;
+  name: string;
+  url: string | null;
+  docs: string | null;
+  /** OpenAPI spec URL advertised by http surfaces (may be YAML). */
+  spec: string | null;
+  auth: {
+    required: boolean;
+    credentialIds: string[];
+    mechanics: IntegrationsSurfaceMechanics | null;
+  };
+}
+
+export interface IntegrationsSurfaceCredential {
+  type: string;
+  label: string;
+  generateUrl: string | null;
+  setup: string | null;
+}
+
+export interface IntegrationsSurfaceResponse {
+  domain: string;
+  summary: string;
+  surfaces: IntegrationsSurfaceEntry[];
+  credentials: Record<string, IntegrationsSurfaceCredential>;
+}
+
+export interface ScriptRunInlineResult {
+  result?: unknown;
+  autoSaved?: { slug: string; reason: string };
+  kvSaved?: { namespace: string; key: string };
+  truncated?: boolean;
+  durationMs?: number;
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number;
+  error?: string;
+  runtimeError?: { name?: string; message?: string; stack?: string };
+}
+
 // External script APIs (POST /api/x/script/<id>) — mirrors ScriptApiRecord in src/types.ts.
 
 export type ScriptApiAuthMode = "none" | "bearer";

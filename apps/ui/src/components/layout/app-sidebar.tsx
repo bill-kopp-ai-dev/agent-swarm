@@ -10,6 +10,7 @@ import {
   FileText,
   Globe,
   Home,
+  Link2,
   ListTodo,
   MessageSquare,
   Settings,
@@ -110,6 +111,7 @@ const navGroups: NavGroup[] = [
     items: [
       { title: "Skills", path: "/skills", icon: BookOpen },
       { title: "MCP Servers", path: "/mcp-servers", icon: Cable },
+      { title: "Connections", path: "/connections", icon: Link2 },
       { title: "Memory", path: "/memory", icon: Brain },
       {
         title: "Pages",

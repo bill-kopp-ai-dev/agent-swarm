@@ -1,38 +1,152 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { getAgentById } from "@/be/db";
+import { upsertOAuthApp } from "@/be/db-queries/oauth";
+import {
+  getOAuthBindingTokenStatus,
+  getOAuthProviderConfig,
+  type OAuthBindingTokenStatus,
+} from "@/be/oauth-credential-bindings";
 import {
   disableCredentialBinding,
   importLegacyCredentialBindings,
   listRelationalCredentialBindings,
+  type ScriptCredentialBindingRecord,
   upsertCredentialBinding,
 } from "@/be/script-connections";
+import { assertOAuthAppUrlsSafe, assertOAuthProviderIsNotReserved } from "@/oauth/app-validation";
+import { buildAuthorizationUrl } from "@/oauth/wrapper";
 import { can } from "@/rbac";
 import {
   CredentialBindingSchema,
   placeholderForConfigKey,
 } from "@/scripts-runtime/credential-broker";
 import { createToolRegistrar } from "@/tools/utils";
+import { getPublicMcpBaseUrl } from "@/utils/constants";
+import { resolveScopedResourceId, scopedResourceScopeIdSchema } from "@/utils/scoped-resource";
+
+const providerSchema = z
+  .string()
+  .min(1)
+  .max(255)
+  .regex(/^[A-Za-z0-9_-]+$/);
+const tokenStatusSchema = z.enum(["ok", "expiring", "missing"]);
+const credentialBindingToolBindingSchema = CredentialBindingSchema.and(
+  z.object({
+    id: z.string().optional(),
+    source: z.enum(["default", "user", "migration"]).optional(),
+    createdAt: z.string().optional(),
+    updatedAt: z.string().optional(),
+    createdBy: z.string().nullable().optional(),
+    updatedBy: z.string().nullable().optional(),
+    tokenStatus: tokenStatusSchema.optional(),
+  }),
+);
 
 const credentialBindingsOutputSchema = z.object({
   yourAgentId: z.string().uuid().optional(),
   success: z.boolean(),
   message: z.string(),
-  bindings: z.array(CredentialBindingSchema),
+  provider: z.string().optional(),
+  authorizeUrl: z.string().optional(),
+  redirectUri: z.string().optional(),
+  bindings: z.array(credentialBindingToolBindingSchema),
 });
 
 const credentialBindingsInputSchema = z.object({
   action: z
-    .enum(["list", "upsert", "disable", "import-legacy"])
-    .describe("List, add/update, disable, or import legacy JSON bindings."),
-  id: z.string().uuid().optional(),
-  configKey: z.string().min(1).max(255).optional(),
-  allowedHosts: z.array(z.string().min(1)).min(1).optional(),
-  headerTemplate: z.string().min(1).optional(),
-  queryTemplate: z.string().min(1).optional(),
-  scope: z.enum(["global", "agent", "repo"]).default("global").optional(),
-  scopeId: z.string().uuid().nullable().optional(),
+    .enum(["list", "upsert", "disable", "import-legacy", "oauth-app-upsert", "oauth-authorize-url"])
+    .describe(
+      "List, add/update, disable, import legacy JSON bindings, or register/authorize OAuth apps.",
+    ),
+  id: z
+    .string()
+    .uuid()
+    .optional()
+    .describe("Existing credential binding ID for update or disable."),
+  configKey: z
+    .string()
+    .min(1)
+    .max(255)
+    .optional()
+    .describe("Swarm config key whose secret value is injected through templates."),
+  allowedHosts: z
+    .array(z.string().min(1))
+    .min(1)
+    .optional()
+    .describe("Allowed outbound hostnames for this binding."),
+  headerTemplate: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("Header template containing the config-key placeholder."),
+  queryTemplate: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("Query parameter template containing the config-key placeholder."),
+  scope: z
+    .enum(["global", "agent", "repo"])
+    .default("global")
+    .optional()
+    .describe("Binding visibility scope."),
+  scopeId: scopedResourceScopeIdSchema
+    .nullable()
+    .optional()
+    .describe("Agent UUID for agent scope or repo id (owner/name) for repo scope."),
+  authKind: z
+    .enum(["config", "oauth"])
+    .default("config")
+    .optional()
+    .describe("Use config for stored swarm config secrets or oauth for OAuth token resolution."),
+  oauthProvider: providerSchema
+    .optional()
+    .describe("OAuth provider slug required when authKind is oauth."),
+  provider: providerSchema
+    .optional()
+    .describe("OAuth provider slug for oauth-app-upsert and oauth-authorize-url."),
+  clientId: z.string().min(1).optional().describe("OAuth client ID for oauth-app-upsert."),
+  clientSecret: z.string().min(1).optional().describe("OAuth client secret for oauth-app-upsert."),
+  authorizeUrl: z
+    .string()
+    .url()
+    .optional()
+    .describe("OAuth authorization URL for oauth-app-upsert."),
+  tokenUrl: z.string().url().optional().describe("OAuth token URL for oauth-app-upsert."),
+  scopes: z.array(z.string().min(1)).optional().describe("OAuth scopes for oauth-app-upsert."),
+  extraParams: z
+    .record(z.string(), z.string())
+    .optional()
+    .describe("Extra OAuth authorization parameters stored with the OAuth app."),
+  tokenAuthStyle: z
+    .enum(["body", "basic"])
+    .optional()
+    .describe(
+      "How client credentials reach the token endpoint: body params (default) or HTTP Basic auth (required by e.g. Notion).",
+    ),
+  tokenBodyFormat: z
+    .enum(["form", "json"])
+    .optional()
+    .describe(
+      "Token request body encoding: form-urlencoded (default) or JSON (required by e.g. Notion).",
+    ),
 });
+
+type BindingWithTokenStatus = ScriptCredentialBindingRecord & {
+  tokenStatus?: OAuthBindingTokenStatus;
+};
+
+function genericOAuthRedirectUri(provider: string): string {
+  return `${getPublicMcpBaseUrl()}/api/oauth/${encodeURIComponent(provider)}/callback`;
+}
+
+function decorateBindings(bindings: ScriptCredentialBindingRecord[]): BindingWithTokenStatus[] {
+  return bindings.map((binding) =>
+    binding.authKind === "oauth" && binding.oauthProvider
+      ? { ...binding, tokenStatus: getOAuthBindingTokenStatus(binding.oauthProvider) }
+      : binding,
+  );
+}
 
 export const registerCredentialBindingsTool = (server: McpServer) => {
   createToolRegistrar(server)(
@@ -80,7 +194,133 @@ export const registerCredentialBindingsTool = (server: McpServer) => {
         };
       }
 
-      const bindings = listRelationalCredentialBindings({ includeInactive: true });
+      const currentBindings = () =>
+        decorateBindings(listRelationalCredentialBindings({ includeInactive: true }));
+      const bindings = currentBindings();
+
+      if (args.action === "oauth-app-upsert") {
+        if (
+          !args.provider ||
+          !args.clientId ||
+          !args.clientSecret ||
+          !args.authorizeUrl ||
+          !args.tokenUrl ||
+          !args.scopes
+        ) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "provider, clientId, clientSecret, authorizeUrl, tokenUrl, and scopes are required for oauth-app-upsert.",
+              },
+            ],
+            structuredContent: {
+              yourAgentId: requestInfo.agentId,
+              success: false,
+              message:
+                "provider, clientId, clientSecret, authorizeUrl, tokenUrl, and scopes are required for oauth-app-upsert.",
+              bindings,
+            },
+          };
+        }
+
+        try {
+          assertOAuthProviderIsNotReserved(args.provider);
+          assertOAuthAppUrlsSafe({
+            authorizeUrl: args.authorizeUrl,
+            tokenUrl: args.tokenUrl,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text", text: message }],
+            structuredContent: {
+              yourAgentId: requestInfo.agentId,
+              success: false,
+              message,
+              bindings,
+            },
+          };
+        }
+
+        const redirectUri = genericOAuthRedirectUri(args.provider);
+        upsertOAuthApp(args.provider, {
+          clientId: args.clientId,
+          clientSecret: args.clientSecret,
+          authorizeUrl: args.authorizeUrl,
+          tokenUrl: args.tokenUrl,
+          redirectUri,
+          scopes: args.scopes.join(","),
+          ...(args.extraParams || args.tokenAuthStyle || args.tokenBodyFormat
+            ? {
+                metadata: JSON.stringify({
+                  ...(args.extraParams ? { extraParams: args.extraParams } : {}),
+                  ...(args.tokenAuthStyle ? { tokenAuthStyle: args.tokenAuthStyle } : {}),
+                  ...(args.tokenBodyFormat ? { tokenBodyFormat: args.tokenBodyFormat } : {}),
+                }),
+              }
+            : {}),
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `OAuth app ${args.provider} saved. Redirect URI: ${redirectUri}`,
+            },
+          ],
+          structuredContent: {
+            yourAgentId: requestInfo.agentId,
+            success: true,
+            message: `OAuth app ${args.provider} saved.`,
+            provider: args.provider,
+            redirectUri,
+            bindings: currentBindings(),
+          },
+        };
+      }
+
+      if (args.action === "oauth-authorize-url") {
+        if (!args.provider) {
+          return {
+            content: [{ type: "text", text: "provider is required for oauth-authorize-url." }],
+            structuredContent: {
+              yourAgentId: requestInfo.agentId,
+              success: false,
+              message: "provider is required for oauth-authorize-url.",
+              bindings,
+            },
+          };
+        }
+
+        const config = getOAuthProviderConfig(args.provider);
+        if (!config) {
+          return {
+            content: [{ type: "text", text: `OAuth app ${args.provider} is not configured.` }],
+            structuredContent: {
+              yourAgentId: requestInfo.agentId,
+              success: false,
+              message: `OAuth app ${args.provider} is not configured.`,
+              provider: args.provider,
+              bindings,
+            },
+          };
+        }
+
+        const result = await buildAuthorizationUrl(config);
+        return {
+          content: [{ type: "text", text: result.url }],
+          structuredContent: {
+            yourAgentId: requestInfo.agentId,
+            success: true,
+            message: `OAuth authorization URL generated for ${args.provider}.`,
+            provider: args.provider,
+            authorizeUrl: result.url,
+            redirectUri: config.redirectUri,
+            bindings,
+          },
+        };
+      }
 
       if (args.action === "list") {
         return {
@@ -107,7 +347,7 @@ export const registerCredentialBindingsTool = (server: McpServer) => {
 
       if (args.action === "import-legacy") {
         const imported = importLegacyCredentialBindings();
-        const nextBindings = listRelationalCredentialBindings({ includeInactive: true });
+        const nextBindings = currentBindings();
         return {
           content: [{ type: "text", text: `Imported ${imported} legacy credential binding(s).` }],
           structuredContent: {
@@ -133,7 +373,7 @@ export const registerCredentialBindingsTool = (server: McpServer) => {
           };
         }
 
-        const nextBindings = listRelationalCredentialBindings({ includeInactive: true });
+        const nextBindings = currentBindings();
         return {
           content: [{ type: "text", text: `Credential binding ${disabled.configKey} disabled.` }],
           structuredContent: {
@@ -158,14 +398,17 @@ export const registerCredentialBindingsTool = (server: McpServer) => {
       }
 
       const scope = args.scope ?? "global";
-      const scopeId = scope === "global" ? null : (args.scopeId ?? null);
-      if (scope !== "global" && !scopeId) {
+      let scopeId: string | null;
+      try {
+        scopeId = resolveScopedResourceId(scope, args.scopeId, "bindings");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `scopeId is required for ${scope} bindings.` }],
+          content: [{ type: "text", text: message }],
           structuredContent: {
             yourAgentId: requestInfo.agentId,
             success: false,
-            message: `scopeId is required for ${scope} bindings.`,
+            message,
             bindings,
           },
         };
@@ -184,6 +427,18 @@ export const registerCredentialBindingsTool = (server: McpServer) => {
             success: false,
             message:
               "allowedHosts and at least one of headerTemplate or queryTemplate are required for upsert.",
+            bindings,
+          },
+        };
+      }
+
+      if ((args.authKind ?? "config") === "oauth" && !args.oauthProvider) {
+        return {
+          content: [{ type: "text", text: "oauthProvider is required for oauth bindings." }],
+          structuredContent: {
+            yourAgentId: requestInfo.agentId,
+            success: false,
+            message: "oauthProvider is required for oauth bindings.",
             bindings,
           },
         };
@@ -221,6 +476,8 @@ export const registerCredentialBindingsTool = (server: McpServer) => {
         scope,
         scopeId,
         active: true,
+        authKind: args.authKind ?? "config",
+        oauthProvider: args.oauthProvider,
       });
 
       upsertCredentialBinding({
@@ -232,8 +489,10 @@ export const registerCredentialBindingsTool = (server: McpServer) => {
         scope: nextBinding.scope,
         scopeId: nextBinding.scopeId ?? null,
         active: true,
+        authKind: nextBinding.authKind,
+        oauthProvider: nextBinding.oauthProvider ?? null,
       });
-      const nextBindings = listRelationalCredentialBindings({ includeInactive: true });
+      const nextBindings = currentBindings();
 
       return {
         content: [{ type: "text", text: `Credential binding ${args.configKey} saved.` }],

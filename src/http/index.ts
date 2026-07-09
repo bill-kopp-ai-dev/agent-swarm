@@ -69,6 +69,7 @@ import { handleMcpServers } from "./mcp-servers";
 import { closeIdleMcpUserTransports, handleMcpUser } from "./mcp-user";
 import { handleMemory, startMemoryGc, stopMemoryGc } from "./memory";
 import { handleMetrics } from "./metrics";
+import { handleGenericOAuth } from "./oauth-generic";
 import { handleOAuthLocks } from "./oauth-locks";
 import { handlePageProxy } from "./page-proxy";
 import { handlePages } from "./pages";
@@ -79,6 +80,8 @@ import { handlePromptTemplates } from "./prompt-templates";
 import { handleRepos } from "./repos";
 import { describeRequestRoute } from "./route-def";
 import { handleSchedules } from "./schedules";
+import { handleScriptConnectionProxy } from "./script-connection-proxy";
+import { handleScriptConnections } from "./script-connections";
 import { handleScriptRuns } from "./script-runs";
 import { handleScripts } from "./scripts";
 import { handleSessionData } from "./session-data";
@@ -323,6 +326,8 @@ const httpServer = createHttpServer(async (req, res) => {
         () => handleMetrics(req, res, pathSegments, queryParams, myAgentId),
         () => handleRepos(req, res, pathSegments, queryParams),
         () => handleSkills(req, res, pathSegments, queryParams, myAgentId),
+        () => handleScriptConnections(req, res, pathSegments, queryParams, myAgentId),
+        () => handleScriptConnectionProxy(req, res, pathSegments, queryParams, myAgentId),
         () => handleScriptRuns(req, res, pathSegments, queryParams, myAgentId),
         () => handleScripts(req, res, pathSegments, queryParams, myAgentId),
         () => handleX(req, res, pathSegments),
@@ -331,6 +336,7 @@ const httpServer = createHttpServer(async (req, res) => {
         () => handleMcpOAuth(req, res, pathSegments, queryParams),
         () => handleMemory(req, res, pathSegments, myAgentId),
         () => handleOAuthLocks(req, res, pathSegments, queryParams),
+        () => handleGenericOAuth(req, res, pathSegments, queryParams),
         () => handleCodexOAuthKeepWarm(req, res, pathSegments),
         () => handlePagesPublic(req, res, pathSegments, queryParams),
         () => handlePageProxy(req, res),
@@ -619,6 +625,14 @@ httpServer
     if (process.env.OAUTH_KEEPALIVE_DISABLE !== "true") {
       const { startOAuthKeepalive } = await import("../oauth/keepalive");
       startOAuthKeepalive();
+    }
+
+    // Start generic OAuth token refresh sweep (all oauth_apps providers,
+    // 15-min tick, first run ~1 min after boot). Complements the tracker-only
+    // keepalive above — see src/be/oauth-refresh-sweep.ts.
+    if (process.env.OAUTH_REFRESH_SWEEP_DISABLE !== "true") {
+      const { startOAuthRefreshSweep } = await import("../be/oauth-refresh-sweep");
+      startOAuthRefreshSweep();
     }
 
     // Start MCP OAuth pending-session garbage collector (5-min tick)

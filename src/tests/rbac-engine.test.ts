@@ -83,7 +83,10 @@ const LEAD_OR_TASK_CREATOR_VERBS: PermissionVerb[] = ["task.cancel.any"];
 
 const LEAD_OR_OWN_NAMESPACE_VERBS: PermissionVerb[] = ["kv.write.any"];
 
-const ANY_AUTHENTICATED_VERBS: PermissionVerb[] = ["mcp-oauth.authorize.any"];
+const ANY_AUTHENTICATED_VERBS: PermissionVerb[] = [
+  "script-connection.invoke",
+  "mcp-oauth.authorize.any",
+];
 
 const REQUESTER_OWNS_TASK_VERBS: PermissionVerb[] = [
   "task.read.own",
@@ -278,6 +281,23 @@ describe("lead-or-own-namespace verbs (kv.write.any)", () => {
     });
     expect(decision.allow).toBe(false);
   });
+});
+
+describe("any-authenticated verbs", () => {
+  const expected: Expected = {
+    lead: true,
+    worker: true,
+    ownerWorker: true,
+    creatorWorker: true,
+    userRequester: true,
+    foreignUser: true,
+    operator: true,
+  };
+  for (const verb of ANY_AUTHENTICATED_VERBS) {
+    test(`${verb}: every authenticated principal is allowed`, () => {
+      expectDecisions(verb, { kind: "none" }, expected);
+    });
+  }
 });
 
 describe("requester-owns-task verbs", () => {

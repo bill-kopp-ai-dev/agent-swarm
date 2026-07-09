@@ -1,18 +1,22 @@
 import { getDb, getSwarmConfigs } from "@/be/db";
+import { assertUrlSafe, publicEndpointSsrfOptions } from "@/oauth/mcp-wrapper";
 import type {
   ScriptApiConnectionDescriptor,
   ScriptApiJsonSchema,
   ScriptApiJsonValue,
   ScriptApiOperationDescriptor,
+  ScriptMcpConnectionDescriptor,
+  ScriptMcpToolDescriptor,
 } from "@/scripts-runtime/api-types";
 import {
   CREDENTIAL_BINDINGS_CONFIG_KEY,
   type CredentialBinding,
   normalizeCredentialBindingsDocument,
 } from "@/scripts-runtime/credential-broker";
+import { listMcpServerTools } from "./mcp-proxy";
 
 export type ScriptConnectionScope = "global" | "agent" | "repo";
-export type ScriptConnectionKind = "raw" | "openapi" | "mcp";
+export type ScriptConnectionKind = "raw" | "openapi" | "mcp" | "graphql";
 
 export type ScriptCredentialBindingRecord = CredentialBinding & {
   id: string;
@@ -60,6 +64,8 @@ type BindingRow = {
   scope: string;
   scope_id: string | null;
   active: number;
+  auth_kind: string;
+  oauth_provider: string | null;
   source: string;
   created_at: string;
   updated_at: string;
@@ -114,6 +120,8 @@ function bindingFromRow(row: BindingRow): ScriptCredentialBindingRecord {
     scope: row.scope as ScriptConnectionScope,
     scopeId: row.scope_id,
     active: row.active === 1,
+    authKind: row.auth_kind === "oauth" ? "oauth" : "config",
+    oauthProvider: row.oauth_provider ?? undefined,
     source: row.source as ScriptCredentialBindingRecord["source"],
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -234,6 +242,8 @@ export function upsertCredentialBinding(data: {
   scope?: ScriptConnectionScope;
   scopeId?: string | null;
   active?: boolean;
+  authKind?: CredentialBinding["authKind"];
+  oauthProvider?: string | null;
   source?: "default" | "user" | "migration";
   userId?: string | null;
 }): ScriptCredentialBindingRecord {
@@ -242,6 +252,11 @@ export function upsertCredentialBinding(data: {
   const scope = data.scope ?? "global";
   const scopeId = scope === "global" ? null : (data.scopeId ?? null);
   const active = data.active === false ? 0 : 1;
+  const authKind = data.authKind ?? "config";
+  if (authKind === "oauth" && !data.oauthProvider) {
+    throw new Error("oauthProvider is required for oauth credential bindings");
+  }
+  const oauthProvider = data.oauthProvider ?? null;
   const source = data.source ?? "user";
   const existing =
     (data.id ? getCredentialBindingById(data.id) : null) ??
@@ -269,12 +284,15 @@ export function upsertCredentialBinding(data: {
           string,
           string | null,
           string,
+          string | null,
+          string,
           string,
         ]
       >(
         `UPDATE script_credential_bindings
          SET config_key = ?, allowed_hosts_json = ?, header_template = ?, query_template = ?,
-             scope = ?, scope_id = ?, active = ?, source = ?, updated_by = ?, updated_at = ?
+             scope = ?, scope_id = ?, active = ?, auth_kind = ?, oauth_provider = ?,
+             source = ?, updated_by = ?, updated_at = ?
          WHERE id = ? RETURNING *`,
       )
       .get(
@@ -285,6 +303,8 @@ export function upsertCredentialBinding(data: {
         scope,
         scopeId,
         active,
+        authKind,
+        oauthProvider,
         source,
         data.userId ?? null,
         now,
@@ -307,6 +327,8 @@ export function upsertCredentialBinding(data: {
         string | null,
         number,
         string,
+        string | null,
+        string,
         string,
         string,
         string | null,
@@ -315,8 +337,8 @@ export function upsertCredentialBinding(data: {
     >(
       `INSERT INTO script_credential_bindings
        (id, config_key, allowed_hosts_json, header_template, query_template, scope, scope_id,
-        active, source, created_at, updated_at, created_by, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        active, auth_kind, oauth_provider, source, created_at, updated_at, created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     )
     .get(
       id,
@@ -327,6 +349,8 @@ export function upsertCredentialBinding(data: {
       scope,
       scopeId,
       active,
+      authKind,
+      oauthProvider,
       source,
       now,
       now,
@@ -382,6 +406,7 @@ export function listScriptConnections(context?: {
   repoId?: string;
   kind?: ScriptConnectionKind;
   includeDisabled?: boolean;
+  allScopes?: boolean;
 }): ScriptConnectionRecord[] {
   const rows = getDb()
     .prepare<ConnectionRow, []>("SELECT * FROM script_connections ORDER BY slug ASC")
@@ -390,7 +415,19 @@ export function listScriptConnections(context?: {
     .map(connectionFromRow)
     .filter((connection) => !context?.kind || connection.kind === context.kind)
     .filter((connection) => context?.includeDisabled || connection.enabled)
-    .filter((connection) => !context || applies(connection.scope, connection.scopeId, context));
+    .filter(
+      (connection) =>
+        !context ||
+        context.allScopes === true ||
+        applies(connection.scope, connection.scopeId, context),
+    );
+}
+
+export function getScriptConnectionById(id: string): ScriptConnectionRecord | null {
+  const row = getDb()
+    .prepare<ConnectionRow, [string]>("SELECT * FROM script_connections WHERE id = ?")
+    .get(id);
+  return row ? connectionFromRow(row) : null;
 }
 
 function schemaToTs(schema: unknown): string {
@@ -529,7 +566,10 @@ function extractOperations(
             (param) => `${JSON.stringify(param.name)}${param.required ? "" : "?"}: ${param.type}`,
           )
           .join("; ");
-      const hasBody = Boolean(jsonContent?.schema || requestBody);
+      // Some generated specs (e.g. readme.io exports) declare a requestBody on
+      // GET operations; fetch() rejects GET/HEAD bodies, so never generate one.
+      const methodAllowsBody = method !== "get" && method !== "head";
+      const hasBody = methodAllowsBody && Boolean(jsonContent?.schema || requestBody);
       const requestType = `export type ${typeBase}Args = {${paramsByPlace("path") ? ` path: { ${paramsByPlace("path")} };` : ""}${paramsByPlace("query") ? ` query?: { ${paramsByPlace("query")} };` : ""}${paramsByPlace("header") ? ` header?: { ${paramsByPlace("header")} };` : ""}${hasBody ? ` body: ${bodyType};` : ""}};`;
       const responseDecl = `export type ${typeBase}Response = ${responseType};`;
       typeBlocks.push(requestType, responseDecl);
@@ -565,13 +605,7 @@ export function buildGeneratedArtifacts(input: {
 }): { generatedTypes: string; generatedRuntimeJson: string } {
   const slug = normalizeSlug(input.slug);
   const { operations, types } = extractOperations(input.openapiSpec, slug);
-  const credential = input.credentialBinding
-    ? {
-        configKey: input.credentialBinding.configKey,
-        headerTemplate: input.credentialBinding.headerTemplate,
-        queryTemplate: input.credentialBinding.queryTemplate,
-      }
-    : null;
+  const credential = credentialDescriptor(input.credentialBinding);
   const descriptor: ScriptApiConnectionDescriptor = {
     slug,
     baseUrl: input.baseUrl,
@@ -590,7 +624,205 @@ export function buildGeneratedArtifacts(input: {
   return { generatedTypes, generatedRuntimeJson: JSON.stringify(descriptor) };
 }
 
-export function upsertScriptConnection(data: {
+function credentialDescriptor(binding: ScriptCredentialBindingRecord | null) {
+  return binding
+    ? {
+        configKey: binding.configKey,
+        headerTemplate: binding.headerTemplate,
+        queryTemplate: binding.queryTemplate,
+      }
+    : null;
+}
+
+export function buildGraphqlGeneratedArtifacts(input: {
+  slug: string;
+  baseUrl: string;
+  credentialBinding: ScriptCredentialBindingRecord | null;
+}): { generatedTypes: string; generatedRuntimeJson: string } {
+  const slug = normalizeSlug(input.slug);
+  const descriptor: ScriptApiConnectionDescriptor = {
+    slug,
+    kind: "graphql",
+    baseUrl: input.baseUrl,
+    credential: credentialDescriptor(input.credentialBinding),
+  };
+  const generatedTypes = [
+    `export interface ${pascal(slug)}Api {`,
+    "  graphql<T = JsonValue>(query: string, variables?: Record<string, JsonValue>): Promise<T>;",
+    "}",
+  ].join("\n");
+  return { generatedTypes, generatedRuntimeJson: JSON.stringify(descriptor) };
+}
+
+type OpenapiSpecFetchResult =
+  | {
+      status: "fetched";
+      spec: unknown;
+      specJson: string;
+      etag: string | null;
+      fetchedAt: string;
+    }
+  | {
+      status: "not_modified";
+      etag: string | null;
+      fetchedAt: string;
+    };
+
+let openapiSpecFetchForTesting: typeof fetch | null = null;
+
+export function setOpenapiSpecFetchForTesting(fetchImpl: typeof fetch | null): void {
+  openapiSpecFetchForTesting = fetchImpl;
+}
+
+function openapiSpecUrlOptions() {
+  return publicEndpointSsrfOptions();
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status >= 300 && status < 400 && status !== 304;
+}
+
+function mcpToolMethodName(name: string): string {
+  return normalizeSlug(name);
+}
+
+function mcpToolMethodNames<T extends { name: string }>(
+  tools: T[],
+): Array<{ tool: T; methodName: string }> {
+  const used = new Set<string>();
+  const baseCounts = new Map<string, number>();
+  return tools.map((tool) => {
+    const base = mcpToolMethodName(tool.name);
+    const count = baseCounts.get(base) ?? 0;
+    baseCounts.set(base, count + 1);
+    let methodName = count === 0 ? base : `${base}${count + 1}`;
+    let suffix = count + 2;
+    while (used.has(methodName)) {
+      methodName = `${base}${suffix}`;
+      suffix += 1;
+    }
+    used.add(methodName);
+    return { tool, methodName };
+  });
+}
+
+function mcpToolArgsType(inputSchema: unknown): string {
+  if (!inputSchema || typeof inputSchema !== "object") return "Record<string, JsonValue>";
+  const schema = inputSchema as Record<string, unknown>;
+  if (Object.keys(schema).length === 0) return "Record<string, JsonValue>";
+  const type = schemaToTs(schema);
+  return type === "JsonValue" ? "Record<string, JsonValue>" : type;
+}
+
+export function buildMcpGeneratedArtifacts(input: {
+  slug: string;
+  connectionId: string;
+  tools: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>;
+}): { generatedTypes: string; generatedRuntimeJson: string } {
+  const slug = normalizeSlug(input.slug);
+  const methodNames = mcpToolMethodNames(input.tools);
+  const tools: ScriptMcpToolDescriptor[] = input.tools.map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: jsonSchema(tool.inputSchema ?? {}),
+  }));
+  const generatedTypes = [
+    `export interface ${pascal(slug)}Mcp {`,
+    ...methodNames.map(
+      ({ tool, methodName }) =>
+        `  ${methodName}(args: ${mcpToolArgsType(tool.inputSchema)}): Promise<JsonValue>;`,
+    ),
+    "}",
+  ].join("\n");
+  const descriptor: ScriptMcpConnectionDescriptor = {
+    slug,
+    kind: "mcp",
+    connectionId: input.connectionId,
+    tools,
+  };
+  return { generatedTypes, generatedRuntimeJson: JSON.stringify(descriptor) };
+}
+
+function parseOpenapiSpecBody(body: string): unknown {
+  try {
+    return JSON.parse(body);
+  } catch (jsonErr) {
+    const yaml = (Bun as unknown as { YAML?: { parse(input: string): unknown } }).YAML;
+    if (!yaml) {
+      throw new Error(
+        `OpenAPI spec response was not valid JSON. JSON specs only unless Bun.YAML.parse is available: ${
+          jsonErr instanceof Error ? jsonErr.message : String(jsonErr)
+        }`,
+      );
+    }
+    try {
+      return yaml.parse(body);
+    } catch (yamlErr) {
+      throw new Error(
+        `OpenAPI spec response was neither valid JSON nor valid YAML: ${
+          yamlErr instanceof Error ? yamlErr.message : String(yamlErr)
+        }`,
+      );
+    }
+  }
+}
+
+export async function fetchOpenapiSpec(
+  url: string,
+  opts: { etag?: string | null } = {},
+): Promise<OpenapiSpecFetchResult> {
+  let parsed = assertUrlSafe(url, openapiSpecUrlOptions());
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const headers = new Headers({
+      Accept: "application/json, application/yaml;q=0.9, text/yaml;q=0.8, */*;q=0.5",
+    });
+    if (opts.etag) headers.set("If-None-Match", opts.etag);
+    const fetchImpl = openapiSpecFetchForTesting ?? Bun.fetch;
+    let response: Response | null = null;
+    for (let hop = 0; hop <= 5; hop += 1) {
+      response = await fetchImpl(parsed, {
+        headers,
+        signal: controller.signal,
+        redirect: "manual",
+      });
+      if (!isRedirectStatus(response.status)) break;
+      const location = response.headers.get("location");
+      if (!location) {
+        throw new Error(`OpenAPI spec redirect missing Location header: HTTP ${response.status}`);
+      }
+      parsed = assertUrlSafe(new URL(location, parsed).toString(), openapiSpecUrlOptions());
+      if (hop === 5) throw new Error("OpenAPI spec fetch exceeded 5 redirects.");
+    }
+    if (!response) throw new Error("OpenAPI spec fetch failed before receiving a response.");
+    const fetchedAt = new Date().toISOString();
+    const etag = response.headers.get("etag");
+    if (response.status === 304) {
+      return { status: "not_modified", etag, fetchedAt };
+    }
+    if (!response.ok) {
+      throw new Error(`Failed to fetch OpenAPI spec: HTTP ${response.status}`);
+    }
+    const spec = parseOpenapiSpecBody(await response.text());
+    return {
+      status: "fetched",
+      spec,
+      specJson: JSON.stringify(spec),
+      etag,
+      fetchedAt,
+    };
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error("Timed out fetching OpenAPI spec after 15s");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function upsertScriptConnection(data: {
   id?: string;
   slug: string;
   displayName?: string | null;
@@ -602,23 +834,67 @@ export function upsertScriptConnection(data: {
   credentialBindingId?: string | null;
   openapiSpecSourceKind?: "url" | "inline" | "agent_fs" | null;
   openapiSpecSource?: string | null;
+  openapiSpecUrl?: string | null;
   openapiSpecJson?: string | null;
+  openapiSpecEtag?: string | null;
+  openapiSpecFetchedAt?: string | null;
   mcpServerId?: string | null;
   enabled?: boolean;
+  agentId?: string;
   userId?: string | null;
-}): ScriptConnectionRecord {
+}): Promise<ScriptConnectionRecord> {
   const now = new Date().toISOString();
   const id = data.id ?? crypto.randomUUID();
   const scope = data.scope ?? "global";
   const scopeId = scope === "global" ? null : (data.scopeId ?? null);
+  const normalizedSlug = normalizeSlug(data.slug);
   let generatedTypes: string | null = null;
   let generatedRuntimeJson: string | null = null;
   let generationError: string | null = null;
   let generatedAt: string | null = null;
+  let openapiSpecJson = data.openapiSpecJson ?? null;
+  let openapiSpecSourceKind =
+    data.openapiSpecSourceKind ??
+    (data.kind === "openapi" ? (data.openapiSpecUrl ? "url" : "inline") : null);
+  let openapiSpecSource = data.openapiSpecSource ?? data.openapiSpecUrl ?? null;
+  let openapiSpecEtag = data.openapiSpecEtag ?? null;
+  let openapiSpecFetchedAt = data.openapiSpecFetchedAt ?? null;
+  let openapiSpec: unknown;
+
+  const existing = data.id
+    ? getDb()
+        .prepare<{ id: string; version: number }, [string]>(
+          "SELECT id, version FROM script_connections WHERE id = ?",
+        )
+        .get(data.id)
+    : getDb()
+        .prepare<{ id: string; version: number }, [string, string, string | null]>(
+          "SELECT id, version FROM script_connections WHERE slug = ? AND scope = ? AND COALESCE(scope_id, '') = COALESCE(?, '')",
+        )
+        .get(normalizedSlug, scope, scopeId);
+  const connectionId = existing?.id ?? id;
 
   if (data.kind === "openapi") {
+    if (!openapiSpecJson && data.openapiSpecUrl) {
+      const fetched = await fetchOpenapiSpec(data.openapiSpecUrl);
+      if (fetched.status === "not_modified") {
+        throw new Error("OpenAPI spec URL returned 304 without an existing cached spec.");
+      }
+      openapiSpec = fetched.spec;
+      openapiSpecJson = fetched.specJson;
+      openapiSpecSourceKind = "url";
+      openapiSpecSource = data.openapiSpecUrl;
+      openapiSpecEtag = fetched.etag;
+      openapiSpecFetchedAt = fetched.fetchedAt;
+    }
     try {
-      const spec = JSON.parse(data.openapiSpecJson ?? "{}");
+      // Inline specs may be pasted as YAML too — parse with the same
+      // JSON-then-YAML fallback as fetched specs and store canonical JSON.
+      let spec = openapiSpec;
+      if (!spec) {
+        spec = parseOpenapiSpecBody(openapiSpecJson ?? "{}");
+        openapiSpecJson = JSON.stringify(spec);
+      }
       const binding = data.credentialBindingId
         ? getCredentialBindingById(data.credentialBindingId)
         : null;
@@ -636,20 +912,53 @@ export function upsertScriptConnection(data: {
     }
   }
 
-  const existing = data.id
-    ? getDb()
-        .prepare<{ id: string; version: number }, [string]>(
-          "SELECT id, version FROM script_connections WHERE id = ?",
-        )
-        .get(data.id)
-    : getDb()
-        .prepare<{ id: string; version: number }, [string, string, string | null]>(
-          "SELECT id, version FROM script_connections WHERE slug = ? AND scope = ? AND COALESCE(scope_id, '') = COALESCE(?, '')",
-        )
-        .get(normalizeSlug(data.slug), scope, scopeId);
+  if (data.kind === "mcp") {
+    try {
+      if (!data.mcpServerId) throw new Error("mcpServerId is required for MCP connections");
+      // Resolve MCP auth config in the scope the connection will RUN under:
+      // an agent-scoped connection may rely on that agent's scoped secrets,
+      // which the (lead) caller's own context cannot see.
+      const discoveryContext =
+        scope === "agent" && scopeId
+          ? { agentId: scopeId }
+          : scope === "repo" && scopeId
+            ? { agentId: data.agentId, repoId: scopeId }
+            : { agentId: data.agentId };
+      const tools = await listMcpServerTools(data.mcpServerId, discoveryContext);
+      const artifacts = buildMcpGeneratedArtifacts({
+        slug: data.slug,
+        connectionId,
+        tools,
+      });
+      generatedTypes = artifacts.generatedTypes;
+      generatedRuntimeJson = artifacts.generatedRuntimeJson;
+      generatedAt = now;
+    } catch (err) {
+      generationError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  if (data.kind === "graphql") {
+    if (!data.baseUrl) throw new Error("baseUrl is required for GraphQL connections");
+    if (!data.allowedHosts?.length) {
+      throw new Error("allowedHosts is required for GraphQL connections");
+    }
+    new URL(data.baseUrl);
+    const binding = data.credentialBindingId
+      ? getCredentialBindingById(data.credentialBindingId)
+      : null;
+    const artifacts = buildGraphqlGeneratedArtifacts({
+      slug: data.slug,
+      baseUrl: data.baseUrl,
+      credentialBinding: binding,
+    });
+    generatedTypes = artifacts.generatedTypes;
+    generatedRuntimeJson = artifacts.generatedRuntimeJson;
+    generatedAt = now;
+  }
 
   const params = [
-    normalizeSlug(data.slug),
+    normalizedSlug,
     data.displayName ?? null,
     data.kind,
     scope,
@@ -657,9 +966,11 @@ export function upsertScriptConnection(data: {
     data.baseUrl ?? null,
     JSON.stringify(data.allowedHosts ?? []),
     data.credentialBindingId ?? null,
-    data.openapiSpecSourceKind ?? (data.kind === "openapi" ? "inline" : null),
-    data.openapiSpecSource ?? null,
-    data.openapiSpecJson ?? null,
+    openapiSpecSourceKind,
+    openapiSpecSource,
+    openapiSpecJson,
+    openapiSpecEtag,
+    openapiSpecFetchedAt,
     data.mcpServerId ?? null,
     generatedTypes,
     generatedRuntimeJson,
@@ -674,7 +985,8 @@ export function upsertScriptConnection(data: {
         `UPDATE script_connections SET
           slug = ?, display_name = ?, kind = ?, scope = ?, scope_id = ?, base_url = ?,
           allowed_hosts_json = ?, credential_binding_id = ?, openapi_spec_source_kind = ?,
-          openapi_spec_source = ?, openapi_spec_json = ?, mcp_server_id = ?, generated_types = ?,
+          openapi_spec_source = ?, openapi_spec_json = ?, openapi_spec_etag = ?,
+          openapi_spec_fetched_at = ?, mcp_server_id = ?, generated_types = ?,
           generated_runtime_json = ?, generated_at = ?, generation_error = ?, enabled = ?,
           updated_at = ?, updated_by = ?, version = ?
          WHERE id = ? RETURNING *`,
@@ -692,13 +1004,90 @@ export function upsertScriptConnection(data: {
       `INSERT INTO script_connections
        (id, slug, display_name, kind, scope, scope_id, base_url, allowed_hosts_json,
         credential_binding_id, openapi_spec_source_kind, openapi_spec_source, openapi_spec_json,
-        mcp_server_id, generated_types, generated_runtime_json, generated_at, generation_error,
-        enabled, created_at, updated_at, created_by, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        openapi_spec_etag, openapi_spec_fetched_at, mcp_server_id, generated_types,
+        generated_runtime_json, generated_at, generation_error, enabled, created_at, updated_at,
+        created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     )
     .get(id, ...params, now, now, data.userId ?? null, data.userId ?? null);
   if (!row) throw new Error("Failed to create script connection");
   return connectionFromRow(row);
+}
+
+export async function refreshScriptConnection(
+  id: string,
+  userId?: string | null,
+  callerAgentId?: string,
+): Promise<ScriptConnectionRecord | null> {
+  const row = getDb()
+    .prepare<ConnectionRow, [string]>("SELECT * FROM script_connections WHERE id = ?")
+    .get(id);
+  if (!row) return null;
+  const connection = connectionFromRow(row);
+
+  // MCP refresh = re-run tool discovery (servers add/remove tools over time).
+  // Route through the upsert path so discovery scoping, versioning, and
+  // generation-error handling stay identical to registration.
+  if (connection.kind === "mcp") {
+    if (!connection.mcpServerId) {
+      throw new Error("MCP connection has no mcpServerId to refresh from.");
+    }
+    return upsertScriptConnection({
+      id: connection.id,
+      slug: connection.slug,
+      displayName: connection.displayName,
+      kind: "mcp",
+      scope: connection.scope,
+      scopeId: connection.scopeId,
+      allowedHosts: connection.allowedHosts,
+      credentialBindingId: connection.credentialBindingId,
+      mcpServerId: connection.mcpServerId,
+      enabled: connection.enabled,
+      agentId: callerAgentId,
+      userId,
+    });
+  }
+
+  if (connection.kind !== "openapi") {
+    throw new Error("Only OpenAPI and MCP script connections can be refreshed.");
+  }
+  if (connection.openapiSpecSourceKind !== "url" || !connection.openapiSpecSource) {
+    throw new Error("Only OpenAPI script connections registered by URL can be refreshed.");
+  }
+
+  const fetched = await fetchOpenapiSpec(connection.openapiSpecSource, {
+    etag: connection.openapiSpecEtag,
+  });
+  if (fetched.status === "not_modified") {
+    const refreshed = getDb()
+      .prepare<ConnectionRow, [string, string]>(
+        `UPDATE script_connections
+         SET openapi_spec_fetched_at = ?
+         WHERE id = ? RETURNING *`,
+      )
+      .get(fetched.fetchedAt, id);
+    return refreshed ? connectionFromRow(refreshed) : null;
+  }
+
+  return upsertScriptConnection({
+    id: connection.id,
+    slug: connection.slug,
+    displayName: connection.displayName,
+    kind: "openapi",
+    scope: connection.scope,
+    scopeId: connection.scopeId,
+    baseUrl: connection.baseUrl,
+    allowedHosts: connection.allowedHosts,
+    credentialBindingId: connection.credentialBindingId,
+    openapiSpecSourceKind: "url",
+    openapiSpecSource: connection.openapiSpecSource,
+    openapiSpecJson: fetched.specJson,
+    openapiSpecEtag: fetched.etag,
+    openapiSpecFetchedAt: fetched.fetchedAt,
+    mcpServerId: connection.mcpServerId,
+    enabled: connection.enabled,
+    userId,
+  });
 }
 
 export function setScriptConnectionEnabled(
@@ -719,7 +1108,8 @@ export function setScriptConnectionEnabled(
 export function getScriptApiConnectionDescriptors(
   context: { agentId?: string; repoId?: string } = {},
 ): ScriptApiConnectionDescriptor[] {
-  return listScriptConnections({ ...context, kind: "openapi" })
+  return listScriptConnections(context)
+    .filter((connection) => connection.kind === "openapi" || connection.kind === "graphql")
     .map((connection) => {
       if (!connection.generatedRuntimeJson) return null;
       try {
@@ -731,8 +1121,25 @@ export function getScriptApiConnectionDescriptors(
     .filter((descriptor): descriptor is ScriptApiConnectionDescriptor => Boolean(descriptor));
 }
 
+export function getScriptMcpConnectionDescriptors(
+  context: { agentId?: string; repoId?: string } = {},
+): ScriptMcpConnectionDescriptor[] {
+  return listScriptConnections({ ...context, kind: "mcp" })
+    .map((connection) => {
+      if (!connection.generatedRuntimeJson) return null;
+      try {
+        return JSON.parse(connection.generatedRuntimeJson) as ScriptMcpConnectionDescriptor;
+      } catch {
+        return null;
+      }
+    })
+    .filter((descriptor): descriptor is ScriptMcpConnectionDescriptor => Boolean(descriptor));
+}
+
 export function getScriptApiTypes(context: { agentId?: string; repoId?: string } = {}): string {
-  const connections = listScriptConnections({ ...context, kind: "openapi" });
+  const connections = listScriptConnections(context).filter(
+    (connection) => connection.kind === "openapi" || connection.kind === "graphql",
+  );
   const blocks = connections
     .filter((connection) => connection.generatedTypes)
     .map((connection) => connection.generatedTypes as string);
@@ -741,4 +1148,16 @@ export function getScriptApiTypes(context: { agentId?: string; repoId?: string }
     .filter((connection) => connection.generatedTypes)
     .map((connection) => `  ${connection.slug}: ${pascal(connection.slug)}Api;`);
   return `${blocks.join("\n\n")}\n\nexport interface ScriptApiRegistry {\n${members.join("\n")}\n}\n`;
+}
+
+export function getScriptMcpTypes(context: { agentId?: string; repoId?: string } = {}): string {
+  const connections = listScriptConnections({ ...context, kind: "mcp" });
+  const blocks = connections
+    .filter((connection) => connection.generatedTypes)
+    .map((connection) => connection.generatedTypes as string);
+  if (blocks.length === 0) return "export interface ScriptMcpRegistry {}\n";
+  const members = connections
+    .filter((connection) => connection.generatedTypes)
+    .map((connection) => `  ${connection.slug}: ${pascal(connection.slug)}Mcp;`);
+  return `${blocks.join("\n\n")}\n\nexport interface ScriptMcpRegistry {\n${members.join("\n")}\n}\n`;
 }

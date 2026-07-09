@@ -3,7 +3,12 @@ import { z } from "zod";
 import { resolveHttpAuditUserId } from "../be/audit-user";
 import { getAgentById, recordInlineScriptRun, upsertKv } from "../be/db";
 import { createEvent } from "../be/events";
-import { getScriptApiConnectionDescriptors, getScriptApiTypes } from "../be/script-connections";
+import {
+  getScriptApiConnectionDescriptors,
+  getScriptApiTypes,
+  getScriptMcpConnectionDescriptors,
+  getScriptMcpTypes,
+} from "../be/script-connections";
 import { buildScriptCredentialBindings } from "../be/script-credential-broker";
 import {
   createScriptApi,
@@ -23,8 +28,8 @@ import {
 import { searchScripts } from "../be/scripts/embeddings";
 import { extractArgsJsonSchema } from "../be/scripts/extract-schema";
 import {
-  SCRIPT_STDLIB_TYPES,
   scriptSdkTypesWithGeneratedApis,
+  scriptStdlibTypesWithGeneratedApis,
   typecheckScript,
 } from "../be/scripts/typecheck";
 import { can } from "../rbac";
@@ -511,8 +516,9 @@ export async function handleScripts(
       args: parsed.body.args,
       fsMode,
       agentId: agent.id,
-      egressSecrets: buildScriptCredentialBindings({ agentId: agent.id }),
+      egressSecrets: await buildScriptCredentialBindings({ agentId: agent.id }),
       apiConnections: getScriptApiConnectionDescriptors({ agentId: agent.id }),
+      mcpConnections: getScriptMcpConnectionDescriptors({ agentId: agent.id }),
     });
 
     // Persist output to KV when idempotencyKey is provided and run succeeded
@@ -667,9 +673,11 @@ export async function handleScripts(
   // Must be matched before getScriptByIdRoute — its ["api", "scripts", null]
   // pattern would otherwise swallow the literal "type-defs" segment.
   if (typeDefsRoute.match(req.method, pathSegments)) {
+    const apiTypes = getScriptApiTypes();
+    const mcpTypes = getScriptMcpTypes();
     json(res, {
-      sdkTypes: scriptSdkTypesWithGeneratedApis(getScriptApiTypes()),
-      stdlibTypes: SCRIPT_STDLIB_TYPES,
+      sdkTypes: scriptSdkTypesWithGeneratedApis(apiTypes, mcpTypes),
+      stdlibTypes: scriptStdlibTypesWithGeneratedApis(apiTypes, mcpTypes),
     });
     return true;
   }
@@ -718,8 +726,14 @@ export async function handleScripts(
     json(res, {
       signature: JSON.parse(script.signatureJson),
       argsJsonSchema: script.argsJsonSchema ? (JSON.parse(script.argsJsonSchema) as unknown) : null,
-      sdkTypes: scriptSdkTypesWithGeneratedApis(getScriptApiTypes({ agentId: agent.id })),
-      stdlibTypes: SCRIPT_STDLIB_TYPES,
+      sdkTypes: scriptSdkTypesWithGeneratedApis(
+        getScriptApiTypes({ agentId: agent.id }),
+        getScriptMcpTypes({ agentId: agent.id }),
+      ),
+      stdlibTypes: scriptStdlibTypesWithGeneratedApis(
+        getScriptApiTypes({ agentId: agent.id }),
+        getScriptMcpTypes({ agentId: agent.id }),
+      ),
     });
     return true;
   }
